@@ -1,11 +1,10 @@
 # main.py
 import json
-import os
 import asyncio
 import discord
+import websockets
 from discord.ui import Button, View
-from playwright.async_api import async_playwright
-from config import BOT_TOKEN, URL_JEU_1WIN, CIBLE_WS
+from config import BOT_TOKEN, CIBLE_WS
 from database import initialiser_structure_bdd, enregistrer_tirage, generer_analyse_profonde
 
 # Configuration des Intentions du Bot Discord
@@ -13,7 +12,11 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
+# URL d'accès direct au flux du jeu
+WS_ENDPOINT = f"wss://{CIBLE_WS}/connection/websocket"
+
 class BoutonPredictionView(View):
+    """Interface graphique du bouton sous le message Discord."""
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -29,68 +32,55 @@ async def on_ready():
     for guild in client.guilds:
         for channel in guild.text_channels:
             if channel.permissions_for(guild.me).send_messages:
-                await channel.send("🕹️ **PANNEAU DOUBLE-MIND**\nCliquez sur le bouton ci-dessous à tout moment pour obtenir une prédiction.", view=BoutonPredictionView())
+                await channel.send("🕹️ **PANNEAU DOUBLE-MIND**\nCliquez sur le bouton ci-dessous à tout moment pour analyser le flux du jeu.", view=BoutonPredictionView())
                 break
         break
 
-async def gestionnaire_websocket(ws):
-    print("🛰️ [OK] Interception réussie du flux Centrifugo sécurisé.")
-    
-    async def intercept_frame(payload):
-        try:
-            data = json.loads(payload)
-            if "pub" in data.get("push", {}):
-                pub_data = data["push"]["pub"]
-                game_data = pub_data.get("data", {})
-                
-                if game_data.get("stage") == "ending":
-                    outcome = game_data.get("outcome")
-                    if outcome:
-                        print(f"🔴 [FLUX] Fin de manche. Résultat enregistré : {outcome.upper()}")
-                        enregistrer_tirage(outcome)
-        except Exception:
-            pass
-
-    ws.on("framereceived", intercept_frame)
-
-async def executer_flux():
-    """Initialise un Chromium ultra-léger sans aucune dépendance graphique Linux."""
+async def ecouter_flux_jeu():
+    """Se connecte en direct au serveur du jeu et gère le protocole de communication."""
     initialiser_structure_bdd()
-    print("🌐 Préparation du moteur Chromium autonome...")
+    print("🛰️ Connexion directe au serveur de flux...")
     
-    # Force le téléchargement si absent sur FadeHost
-    os.system("python -m playwright install chromium")
+    # En-têtes essentiels pour simuler un accès conforme
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Origin": "https://1win.pro"
+    }
     
-    async with async_playwright() as p:
-        # 🛠️ ARGUMENTS EXPERTS : Coupe tout composant graphique, audio ou GPU 
-        # Cela évite le plantage lié aux librairies système Linux manquantes sur FadeHost
-        arguments_serveur = [
-            "--disable-gpu",
-            "--disable-software-rasterizer",
-            "--disable-dev-shm-usage",
-            "--no-sandbox",
-            "--headless",
-            "--mute-audio"
-        ]
-        
-        browser = await p.chromium.launch(
-            headless=True,
-            args=arguments_serveur
-        ) 
-        context = await browser.new_context()
-        page = await context.new_page()
-        
-        # Filtre le trafic réseau pour cibler le flux Centrifugo
-        page.on("websocket", lambda ws: asyncio.create_task(gestionnaire_websocket(ws)) if CIBLE_WS in ws.url else None)
-        
-        print(f"🔗 Navigation vers la plateforme...")
-        await page.goto(URL_JEU_1WIN)
-        await asyncio.Event().wait()
+    while True:
+        try:
+            async with websockets.connect(WS_ENDPOINT, extra_headers=headers, ping_interval=20, ping_timeout=20) as ws:
+                print("✅ [FLUX] Connecté en direct à l'infrastructure réseau.")
+                
+                # Envoi du message de connexion au format JSON standard pour initialiser l'écoute
+                init_frame = {"id": 1, "method": "connect", "params": {}}
+                await ws.send(json.dumps(init_frame))
+                
+                async for message_brut in ws:
+                    try:
+                        data = json.loads(message_brut)
+                        
+                        # Interception et décodage des résultats de fin de manche
+                        if "pub" in data.get("push", {}):
+                            pub_data = data["push"]["pub"]
+                            game_data = pub_data.get("data", {})
+                            
+                            if game_data.get("stage") == "ending":
+                                outcome = game_data.get("outcome")
+                                if outcome:
+                                    print(f"🔴 [FLUX] Partie terminée. Résultat enregistré : {outcome.upper()}")
+                                    enregistrer_tirage(outcome)
+                    except json.JSONDecodeError:
+                        pass
+        except (websockets.ConnectionClosed, Exception) as e:
+            print(f"⚠️ Flux temporairement indisponible ({e}). Nouvelle tentative dans 5 secondes...")
+            await asyncio.sleep(5)
 
 async def main():
+    # Exécution simultanée de l'application Discord et de la capture réseau
     await asyncio.gather(
         client.start(BOT_TOKEN),
-        executer_flux()
+        ecouter_flux_jeu()
     )
 
 if __name__ == "__main__":
