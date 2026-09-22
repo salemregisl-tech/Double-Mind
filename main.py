@@ -1,18 +1,17 @@
 # main.py
 import json
+import os
 import asyncio
 import discord
-import websockets
 from discord.ui import Button, View
-from config import BOT_TOKEN, CIBLE_WS
+from playwright.async_api import async_playwright
+from config import BOT_TOKEN, URL_JEU_1WIN, CIBLE_WS
 from database import initialiser_structure_bdd, enregistrer_tirage, generer_analyse_profonde
 
+# Configuration des Intentions du Bot Discord
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
-
-# Point d'accès standardisé de la connexion brute
-WS_ENDPOINT = f"wss://{CIBLE_WS}/connection/websocket"
 
 class BoutonPredictionView(View):
     def __init__(self):
@@ -30,63 +29,72 @@ async def on_ready():
     for guild in client.guilds:
         for channel in guild.text_channels:
             if channel.permissions_for(guild.me).send_messages:
-                await channel.send("🕹️ **PANNEAU DOUBLE-MIND**\nCliquez sur le bouton ci-dessous à tout moment pour obtenir une analyse du marché basée sur le flux de données réel.", view=BoutonPredictionView())
+                await channel.send("🕹️ **PANNEAU DOUBLE-MIND**\nCliquez sur le bouton ci-dessous à tout moment pour obtenir une prédiction.", view=BoutonPredictionView())
                 break
         break
 
-async def ecouter_flux_jeu():
-    """Se connecte au protocole Centrifugo en transmettant la commande d'autorisation initiale."""
-    initialiser_structure_bdd()
-    print("🛰️ Tentative de connexion réseau au serveur de flux Centrifugo...")
+async def gestionnaire_websocket(ws):
+    print("🛰️ [OK] Interception réussie du flux Centrifugo sécurisé.")
     
-    fake_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Origin": "https://1win.pro"
-    }
-    
-    while True:
+    async def intercept_frame(payload):
         try:
-            async with websockets.connect(WS_ENDPOINT, extra_headers=fake_headers, ping_interval=20, ping_timeout=20) as ws:
-                print("✅ [FLUX] Établissement de la connexion. Envoi du paquet d'initialisation...")
+            data = json.loads(payload)
+            if "pub" in data.get("push", {}):
+                pub_data = data["push"]["pub"]
+                game_data = pub_data.get("data", {})
                 
-                # 🛠️ CORRECTION RESEAU : Envoi de la commande de liaison obligatoire exigée par Centrifugo
-                # Cette commande simule l'autorisation initiale de la page web pour démarrer les publications
-                init_frame = {"id": 1, "method": "connect", "params": {}}
-                await ws.send(json.dumps(init_frame))
-                
-                async for message_brut in ws:
-                    try:
-                        data = json.loads(message_brut)
-                        
-                        # Traitement des données si la liaison est validée
-                        if "pub" in data.get("push", {}):
-                            pub_data = data["push"]["pub"]
-                            game_data = pub_data.get("data", {})
-                            
-                            if game_data.get("stage") == "ending":
-                                outcome = game_data.get("outcome")
-                                if outcome:
-                                    print(f"🔴 [FLUX] Partie terminée. Résultat stocké : {outcome.upper()}")
-                                    enregistrer_tirage(outcome)
-                                    
-                        # Gestion de la réponse de connexion initiale
-                        elif "result" in data and "client" in data["result"]:
-                            print("🔥 [FLUX] Authentification réseau réussie ! Écoute en continu activée.")
-                            
-                    except json.JSONDecodeError:
-                        pass
-        except (websockets.ConnectionClosed, Exception) as e:
-            print(f"⚠️ Flux temporairement indisponible ({e}). Nouvelle tentative dans 5 secondes...")
-            await asyncio.sleep(5)
+                if game_data.get("stage") == "ending":
+                    outcome = game_data.get("outcome")
+                    if outcome:
+                        print(f"🔴 [FLUX] Fin de manche. Résultat enregistré : {outcome.upper()}")
+                        enregistrer_tirage(outcome)
+        except Exception:
+            pass
+
+    ws.on("framereceived", intercept_frame)
+
+async def executer_flux():
+    """Initialise un Chromium ultra-léger sans aucune dépendance graphique Linux."""
+    initialiser_structure_bdd()
+    print("🌐 Préparation du moteur Chromium autonome...")
+    
+    # Force le téléchargement si absent sur FadeHost
+    os.system("python -m playwright install chromium")
+    
+    async with async_playwright() as p:
+        # 🛠️ ARGUMENTS EXPERTS : Coupe tout composant graphique, audio ou GPU 
+        # Cela évite le plantage lié aux librairies système Linux manquantes sur FadeHost
+        arguments_serveur = [
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--headless",
+            "--mute-audio"
+        ]
+        
+        browser = await p.chromium.launch(
+            headless=True,
+            args=arguments_serveur
+        ) 
+        context = await browser.new_context()
+        page = await context.new_page()
+        
+        # Filtre le trafic réseau pour cibler le flux Centrifugo
+        page.on("websocket", lambda ws: asyncio.create_task(gestionnaire_websocket(ws)) if CIBLE_WS in ws.url else None)
+        
+        print(f"🔗 Navigation vers la plateforme...")
+        await page.goto(URL_JEU_1WIN)
+        await asyncio.Event().wait()
 
 async def main():
     await asyncio.gather(
         client.start(BOT_TOKEN),
-        ecouter_flux_jeu()
+        executer_flux()
     )
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[INFO] Arrêt du système Double-Mind.")
+        print("\n[INFO] Arrêt du système.")
