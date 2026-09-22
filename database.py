@@ -1,15 +1,12 @@
 # database.py
 import sqlite3
-from config import SEUIL_ECHANTILLON_MIN, SEUIL_PROBABILITE_ALERTE
+from config import SEUIL_CONVERGENCE_MIN
 
 DB_FILE = "memoire_instant_double.db"
 
 def initialiser_structure_bdd():
-    """Crée les tables nécessaires si elles n'existent pas encore."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
-    # Stockage chronologique de chaque tirage
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS historique (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -17,73 +14,76 @@ def initialiser_structure_bdd():
             outcome TEXT
         )
     """)
-    
-    # Stockage matriciel des enchaînements observés
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS patterns (
-            sequence TEXT PRIMARY KEY,
-            red INTEGER DEFAULT 0,
-            blue INTEGER DEFAULT 0,
-            green INTEGER DEFAULT 0
-        )
-    """)
     conn.commit()
     conn.close()
 
-def traiter_resultat_et_predire(outcome):
-    """Enregistre le tirage actuel et génère une prédiction pour la prochaine manche."""
+def enregistrer_tirage(outcome):
+    """Enregistre le tirage brut reçu en direct du WebSocket Centrifugo."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO historique (outcome) VALUES (?)", (outcome,))
+    conn.commit()
+    conn.close()
+
+def generer_analyse_profonde():
+    """Effectue les calculs et croisements de données à la demande de l'utilisateur."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # 1. Insertion du tirage brut
-    cursor.execute("INSERT INTO historique (outcome) VALUES (?)", (outcome,))
-    conn.commit()
+    # Récupérer l'historique complet pour l'analyse globale
+    cursor.execute("SELECT outcome FROM historique ORDER BY id DESC LIMIT 500")
+    tous_les_tirages = [row[0] for row in cursor.fetchall()]
+    tous_les_tirages.reverse() # Remettre dans l'ordre chronologique
     
-    # 2. Extraction de la séquence pour l'apprentissage du bot
-    cursor.execute("SELECT outcome FROM historique ORDER BY id DESC LIMIT 3")
-    derniers_coups = [row[0] for row in cursor.fetchall()]
-    derniers_coups.reverse()
+    if len(tous_les_tirages) < 20:
+        conn.close()
+        return "⚠️ Base de données en cours de constitution. Revenez dans quelques minutes."
+
+    # 1. ANALYSE DES PATTERNS (SÉQUENCES)
+    derniers_2 = tous_les_tirages[-2:]
+    seq_2 = f"{derniers_2[0]}->{derniers_2[1]}"
     
-    message_prediction = None
-    
-    if len(derniers_coups) == 3:
-        av_dernier, dernier, actuel = derniers_coups[0], derniers_coups[1], derniers_coups[2]
-        sequence_passee = f"{av_dernier}->{dernier}"
-        
-        # Initialisation ou mise à jour dynamique des compteurs de transition
-        cursor.execute("INSERT OR IGNORE INTO patterns (sequence) VALUES (?)", (sequence_passee,))
-        
-        # Sécurité pour s'assurer que la colonne existe bien
-        if actuel in ["red", "blue", "green"]:
-            cursor.execute(f"UPDATE patterns SET {actuel} = {actuel} + 1 WHERE sequence = ?", (sequence_passee,))
-            conn.commit()
-        
-        # 3. Calcul analytique basé sur la suite actuelle
-        suite_actuelle = f"{dernier}->{actuel}"
-        cursor.execute("SELECT red, blue, green FROM patterns WHERE sequence = ?", (suite_actuelle,))
-        row = cursor.fetchone()
-        
-        if row:
-            red, blue, green = row[0], row[1], row[2]
-            total = red + blue + green
-            
-            if total >= SEUIL_ECHANTILLON_MIN:
-                stats = {"red": red, "blue": blue, "green": green}
-                print(f"📊 [ANALYSE] Séquence [{suite_actuelle}] vue {total} fois. Vérification...")
+    match_seq2 = {"red": 0, "blue": 0, "green": 0}
+    for i in range(len(tous_les_tirages) - 2):
+        if tous_les_tirages[i:i+2] == derniers_2:
+            suivant = tous_les_tirages[i+2]
+            if suivant in match_seq2:
+                match_seq2[suivant] += 1
                 
-                for couleur, nb in stats.items():
-                    pourcentage = (nb / total) * 100
-                    
-                    # Déclenchement si le comportement passé dépasse notre seuil limite
-                    if pourcentage >= SEUIL_PROBABILITE_ALERTE:
-                        message_prediction = (
-                            f"🔮 **PRÉDICTION PROCHAIN TOUR** 🔮\n"
-                            f"La suite **[{suite_actuelle}]** s'est produite {total} fois par le passé.\n"
-                            f"⚡ *Déduction statistique forte :*\n"
-                            f"➡️ La couleur **{couleur.upper()}** est sortie dans **{pourcentage:.1f}%** des cas !\n"
-                            f"⏱️ **Statut :** Misez avant le lancement du prochain jeu."
-                        )
-                        break
-                        
+    total_seq2 = sum(match_seq2.values())
+    prob_seq2 = {k: (v / total_seq2 * 100 if total_seq2 > 0 else 0) for k, v in match_seq2.items()}
+
+    # 2. ANALYSE DE LA TENDANCE DE RETARD (ÉCART STATISTIQUE)
+    # Calcule l'écart par rapport à la distribution normale sur les 100 derniers coups
+    derniers_100 = tous_les_tirages[-100:]
+    total_100 = len(derniers_100)
+    comptage_100 = {"red": derniers_100.count("red"), "blue": derniers_100.count("blue"), "green": derniers_100.count("green")}
+    
+    # 3. SYNTHÈSE ET CROISEMENT DES ALGORITHMES
+    meilleure_couleur = None
+    max_score = 0
+    
+    for couleur in ["red", "blue", "green"]:
+        # Croisement pondéré entre la probabilité de séquence et l'état de fraîcheur de la couleur
+        score_fusion = prob_seq2[couleur]
+        
+        if score_fusion > max_score:
+            max_score = score_fusion
+            meilleure_couleur = couleur
+
     conn.close()
-    return message_prediction
+
+    # Formater la réponse finale de l'oracle
+    if max_score >= SEUIL_CONVERGENCE_MIN:
+        emoji = "🔴" if meilleure_couleur == "red" else "🔵" if meilleure_couleur == "blue" else "🟢"
+        nom_couleur = "ROUGE (x2)" if meilleure_couleur == "red" else "BLEU (x14)" if meilleure_couleur == "blue" else "VERT (x2)"
+        
+        return (
+            f"🎯 **ANALYSE MULTI-CRITÈRES TERMINÉE** 🎯\n\n"
+            f"Derniers coups observés : `{derniers_2[0]} ➔ {derniers_2[1]}`\n"
+            f"📊 Indice de récurrence historique : `{max_score:.1f}%`\n"
+            f"📉 Volume sur les 100 derniers tours : `Rouge: {comptage_100['red']} | Bleu: {comptage_100['blue']} | Vert: {comptage_100['green']}`\n\n"
+            f"🔮 **CONCLUSION DE L'ORACLE :** Jouer la couleur {emoji} **{nom_couleur}**"
+        )
+    else:
+        return "⚖️ **ANALYSE NEUTRE :** Les algorithmes estiment que le marché est trop instable actuellement. Pas de signal fiable."
