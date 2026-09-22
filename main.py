@@ -2,43 +2,46 @@
 import json
 import asyncio
 import discord
-from discord.ui import Button, View
+from discord import app_commands
 from config import BOT_TOKEN
 from database import initialiser_structure_bdd, generer_analyse_profonde
 
-intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents)
-
-class PanneauPredictionView(View):
+class DoubleMindBot(discord.Client):
     def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Obtenir la prédiction en direct", style=discord.ButtonStyle.primary, custom_id="btn_predict", emoji="🔮")
-    async def bouton_callback(self, interaction: discord.Interaction):
-        # Réponse immédiate de FadeHost à Discord (Moins de 100ms, plus aucun bug !)
-        await interaction.response.defer(ephemeral=True)
+        # Configuration des intentions de base obligatoires
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(intents=intents)
         
-        # Lance le calcul d'analyse croisée
-        rapport = generer_analyse_profonde()
-        
-        # Affiche le résultat en message privé gris
-        await interaction.followup.send(content=rapport, ephemeral=True)
+        # Initialisation de l'arbre des commandes slash
+        self.tree = app_commands.CommandTree(self)
 
-@client.event
+    async def setup_hook(self):
+        # Synchronise la commande /prediction de manière globale sur Discord
+        await self.tree.sync()
+
+bot = DoubleMindBot()
+
+@bot.event
 async def on_ready():
-    print(f"🤖 Bot Discord connecté sous le nom : {client.user}")
+    print(f"🤖 Bot Discord connecté sous le nom : {bot.user}")
     initialiser_structure_bdd()
+    print("💾 Système Double-Mind prêt. Utilisez la commande /prediction dans votre salon.")
+
+# 🔮 CREATION DE LA COMMANDE SLASH /prediction
+@bot.tree.command(name="prediction", description="Demander une analyse mathématique multi-critères à l'Oracle")
+async def prediction_command(interaction: discord.Interaction):
+    # Indique instantanément à Discord que le bot travaille (évite l'erreur d'expiration)
+    await interaction.response.defer(ephemeral=True)
     
-    for guild in client.guilds:
-        for channel in guild.text_channels:
-            if channel.permissions_for(guild.me).send_messages:
-                await channel.send("🕹️ **PANNEAU DOUBLE-MIND STABLE 24H/24**\nCliquez sur le bouton ci-dessous à tout moment pour obtenir l'analyse de l'Oracle.", view=PanneauPredictionView())
-                break
-        break
+    # Lancement des calculs en arrière-plan
+    rapport = generer_analyse_profonde()
+    
+    # Envoi du résultat final en message privé gris caché
+    await interaction.followup.send(content=rapport, ephemeral=True)
 
 async def main():
-    await client.start(BOT_TOKEN)
+    await bot.start(BOT_TOKEN)
 
 if __name__ == "__main__":
     try:
