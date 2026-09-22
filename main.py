@@ -1,17 +1,19 @@
 # main.py
 import json
-import os
 import asyncio
 import discord
+import websockets
 from discord.ui import Button, View
-from playwright.async_api import async_playwright
-from config import BOT_TOKEN, URL_JEU_1WIN, CIBLE_WS
+from config import BOT_TOKEN, CIBLE_WS
 from database import initialiser_structure_bdd, enregistrer_tirage, generer_analyse_profonde
 
 # Configuration des Intentions du Bot Discord
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
+
+# URL d'accès direct au WebSocket Centrifugo
+WS_ENDPOINT = f"wss://{CIBLE_WS}/connection/websocket"
 
 class BoutonPredictionView(View):
     """Crée l'interface graphique du bouton interactif sous le message."""
@@ -36,51 +38,51 @@ async def on_ready():
     for guild in client.guilds:
         for channel in guild.text_channels:
             if channel.permissions_for(guild.me).send_messages:
-                # Nettoyer le salon et envoyer le bouton d'accès unique
-                await channel.send("🕹️ **PANNEAU DOUBLE-MIND**\nCliquez sur le bouton ci-dessous à tout moment pour analyser le flux du jeu.", view=BoutonPredictionView())
+                # Envoyer le bouton d'accès unique
+                await channel.send("🕹️ **PANNEAU DOUBLE-MIND**\nCliquez sur le bouton ci-dessous à tout moment pour obtenir une analyse du marché basée sur le flux de données réel.", view=BoutonPredictionView())
                 break
         break
 
-async def gestionnaire_websocket(ws):
-    print("🛰️ [OK] Liaison réseau établie avec le module Centrifugo de 1win.")
-    
-    async def intercept_frame(payload):
-        try:
-            data = json.loads(payload)
-            if "pub" in data.get("push", {}):
-                pub_data = data["push"]["pub"]
-                game_data = pub_data.get("data", {})
-                
-                if game_data.get("stage") == "ending":
-                    outcome = game_data.get("outcome")
-                    if outcome:
-                        print(f"🔴 [FLUX] Partie terminée. Enregistrement en BDD : {outcome.upper()}")
-                        # Le bot travaille en silence et stocke le résultat pour enrichir ses futurs calculs
-                        enregistrer_tirage(outcome)
-        except Exception:
-            pass
-
-    ws.on("framereceived", intercept_frame)
-
-async def executer_flux():
+async def ecouter_flux_jeu():
+    """Se connecte en direct au serveur Centrifugo pour écouter les tirages 24h/24."""
     initialiser_structure_bdd()
-    print("🌐 Vérification et installation des binaires de navigation...")
-    os.system("python -m playwright install chromium")
+    print("🛰️ Tentative de connexion directe au serveur de flux Centrifugo...")
     
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True) 
-        context = await browser.new_context()
-        page = await context.new_page()
-        
-        page.on("websocket", lambda ws: asyncio.create_task(gestionnaire_websocket(ws)) if CIBLE_WS in ws.url else None)
-        await page.goto(URL_JEU_1WIN)
-        await asyncio.Event().wait()
+    while True:
+        try:
+            async with websockets.connect(WS_ENDPOINT, ping_interval=20, ping_timeout=20) as ws:
+                print("✅ [FLUX] Connecté en direct à l'infrastructure réseau du casino.")
+                
+                # Format d'initialisation de protocole Centrifugo si nécessaire
+                init_frame = {"id": 1, "method": "connect", "params": {}}
+                await ws.send(json.dumps(init_frame))
+                
+                async for message_brut in ws:
+                    try:
+                        data = json.loads(message_brut)
+                        
+                        # Extraction et lecture des paquets de données du jeu
+                        if "pub" in data.get("push", {}):
+                            pub_data = data["push"]["pub"]
+                            game_data = pub_data.get("data", {})
+                            
+                            if game_data.get("stage") == "ending":
+                                outcome = game_data.get("outcome")
+                                if outcome:
+                                    print(f"🔴 [FLUX] Fin de manche détectée. Résultat enregistré : {outcome.upper()}")
+                                    # Sauvegarde discrète dans la base SQLite locale sur FadeHost
+                                    enregistrer_tirage(outcome)
+                    except json.JSONDecodeError:
+                        pass
+        except (websockets.ConnectionClosed, Exception) as e:
+            print(f"⚠️ Déconnexion du flux ({e}). Nouvelle tentative dans 5 secondes...")
+            await asyncio.sleep(5)
 
 async def main():
-    # Lancement simultané du Bot Discord et de l'intercepteur de flux de casino
+    # Lancement simultané du Bot Discord et de la connexion réseau directe au casino
     await asyncio.gather(
         client.start(BOT_TOKEN),
-        executer_flux()
+        ecouter_flux_jeu()
     )
 
 if __name__ == "__main__":
