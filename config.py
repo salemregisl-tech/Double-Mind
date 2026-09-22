@@ -1,7 +1,8 @@
 # config.py
+import os
 
-# URL du Webhook Discord (votre compte principal)
-URL_WEBHOOK_DISCORD = "https://discord.com"
+# Le bot va lire de manière sécurisée la variable d'environnement sur le serveur FadeHost
+BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 
 # URL d'accès à la plateforme de jeu
 URL_JEU_1WIN = "https://1win.pro"
@@ -9,8 +10,5 @@ URL_JEU_1WIN = "https://1win.pro"
 # Identifiant du serveur de flux pour l'interception réseau
 CIBLE_WS = "centrifugo-ws-mse.live.gamedev-tech.cc"
 
-# Seuil statistique : nombre minimal d'occurrences requises avant de valider une prédiction
-SEUIL_ECHANTILLON_MIN = 5
-
-# Pourcentage minimal de récurrence requis pour déclencher l'envoi d'une alerte
-SEUIL_PROBABILITE_ALERTE = 75.0
+# Paramètres algorithmiques
+SEUIL_CONVERGENCE_MIN = 70.0  # Pourcentage minimal requis après croisement des analyses
