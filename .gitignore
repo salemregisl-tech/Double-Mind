@@ -1,6 +1,0 @@
-# .gitignore
-memoire_instant_double.db
-__pycache__/
-*.pyc
-.env
-.DS_Store
