@@ -1,463 +1,2132 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-================================================================================
- BOT SENTINELLE MEMPOOL - Détection Insiders / Rug Pulls / Gros Achats
- Hébergement cible : FadeHost (Linux, 256 Mo RAM, Python 3.11)
- Flux temps réel   : Alchemy WSS (alchemyPendingTransactions)
-================================================================================
-"""
+# ============================================================
+# main.py
+# ============================================================
+# BOT MEMPOOL ETHEREUM — PRODUCTION
+#
+# Technologies :
+#   - Python 3.11
+#   - discord.py 2.x
+#   - websockets
+#   - Alchemy Ethereum Mainnet WSS
+#
+# Variables FadeHost :
+#
+#   DISCORD_TOKEN
+#   WSS_NODE_URL
+#
+# Variables optionnelles :
+#
+#   ALERT_CHANNEL_ID
+#   LARGE_BUY_ETH
+#   INSIDER_WALLETS
+#
+# Exemple :
+#
+#   LARGE_BUY_ETH = 5
+#
+#   INSIDER_WALLETS =
+#   0x123...,0x456...
+#
+# IMPORTANT :
+#   - Aucun asyncio.run()
+#   - Discord utilise bot.run()
+#   - La Mempool tourne dans une tâche asyncio séparée
+#   - La file de transactions est limitée pour protéger les 256 MB RAM
+#   - Les secrets ne sont jamais affichés intégralement dans les logs
+# ============================================================
+
 
 import os
 import re
-import sys
-import gc
 import json
 import asyncio
 import logging
+from typing import Optional, Dict, Any, Set
 
 import discord
 from discord.ext import commands
 import websockets
 
 
-# ==============================================================================
-# ⚙️  ZONE DE CONFIGURATION — C'EST ICI QUE TU REMPLIS TES INFOS
-# ==============================================================================
-#
-# Remplis les valeurs ci-dessous directement entre les guillemets.
-# ⚠️ Si ton dépôt GitHub est PUBLIC, ne laisse jamais tes vraies clés ici :
-#    utilise plutôt les variables d'environnement du panel FadeHost, qui
-#    resteront prioritaires sur ce qui est écrit ci-dessous (voir plus bas).
-#
-# ------------------------------------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-# Ton token de bot Discord (Discord Developer Portal -> Bot -> Reset Token)
-DISCORD_TOKEN_CONFIG = "MTU1MTk1MjEzNDU3MDc3NDU3OA.GUGw8d.rmKZkD9ekpV7WXjssJAEsMdNkCs8VBcaORMNas"
+DEFAULT_LARGE_BUY_ETH = 5.0
 
-# L'URL WebSocket Alchemy pour Ethereum Mainnet (commence par "wss://", PAS "https://")
-# Exemple : wss://eth-mainnet.g.alchemy.com/v2/TA_CLE_ALCHEMY
-WSS_NODE_URL_CONFIG = "wss://eth-mainnet.g.alchemy.com/v2/alch_2B4IRipwhijWk6icES02Z"
+# Protection RAM.
+# On ne crée pas une tâche illimitée pour chaque transaction.
+MAX_QUEUE_SIZE = 100
+WORKER_COUNT = 4
 
-# L'ID du salon Discord où envoyer les alertes (clic droit sur le salon -> Copier l'ID
-# ; il faut activer le Mode Développeur dans Discord : Réglages -> Avancés)
-DISCORD_CHANNEL_ID_CONFIG = "1551939043397468190"
+# Nombre maximum de hashes gardés en mémoire.
+MAX_SEEN_TRANSACTIONS = 3000
 
-# (Optionnel) Adresses de wallets "insiders" à surveiller, séparées par des virgules
-INSIDER_WALLETS_CONFIG = ""
+# Nombre maximum de requêtes RPC simultanées.
+MAX_RPC_REQUESTS = 40
 
-# (Optionnel) Seuil en ETH à partir duquel un achat est considéré comme "gros achat"
-SEUIL_GROS_ACHAT_ETH_CONFIG = "5"
+# Reconnexion Alchemy.
+RECONNECT_MIN = 2
+RECONNECT_MAX = 30
 
-# ==============================================================================
-# FIN DE LA ZONE DE CONFIGURATION — ne modifie rien en dessous de cette ligne
-# sauf si tu sais ce que tu fais.
-# ==============================================================================
+# Timeout RPC.
+RPC_TIMEOUT = 7
 
 
-# ------------------------------------------------------------------------------
-# 1. LOGGING
-# ------------------------------------------------------------------------------
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("sentinelle_mempool")
+
+logger = logging.getLogger("DoubleMind")
 
 
-# ------------------------------------------------------------------------------
-# 2. LECTURE DE LA CONFIG : variable d'environnement en priorité,
-#    sinon on retombe sur la valeur écrite dans la zone de configuration.
-# ------------------------------------------------------------------------------
+# ============================================================
+# NETTOYAGE ENVIRONNEMENT
+# ============================================================
 
-def nettoyer_valeur(valeur: str) -> str:
-    """Supprime espaces classiques, espaces invisibles et guillemets parasites."""
-    if valeur is None:
+def clean_text(value: Optional[str]) -> str:
+    """
+    Nettoie les espaces et caractères invisibles.
+    """
+
+    if value is None:
         return ""
-    valeur = valeur.strip()
-    valeur = re.sub(r"[\u200b\u200c\u200d\ufeff\u00a0\u2028\u2029]", "", valeur)
-    valeur = valeur.strip("'\"")
-    return valeur.strip()
+
+    value = str(value)
+
+    value = re.sub(
+        r"[\u0000-\u001F\u007F\u200B-\u200D\uFEFF]",
+        "",
+        value,
+    )
+
+    return value.strip()
 
 
-def get_env_robuste(nom_cible: str) -> str:
+def normalize_key(value: str) -> str:
     """
-    Cherche une variable d'environnement en ignorant la casse et les
-    caractères invisibles, en scannant tout os.environ.
+    Normalise le nom d'une variable.
     """
-    cible_normalisee = nom_cible.strip().upper()
-    for cle, valeur in os.environ.items():
-        if cle.strip().upper() == cible_normalisee:
-            valeur_propre = nettoyer_valeur(valeur)
-            if valeur_propre:
-                return valeur_propre
+
+    return clean_text(value).upper()
+
+
+def get_env(name: str) -> str:
+    """
+    Lecture robuste des variables FadeHost.
+
+    Reconnaît notamment :
+        DISCORD_TOKEN
+        discord_token
+        DISCORD_TOKEN avec espaces invisibles
+    """
+
+    wanted = normalize_key(name)
+
+    direct = os.environ.get(name)
+
+    if direct is not None:
+        return clean_text(direct)
+
+    for key, value in os.environ.items():
+
+        if normalize_key(key) == wanted:
+            return clean_text(value)
+
     return ""
 
 
-def charger_config(nom_env: str, valeur_config: str, alias: list[str] | None = None) -> str:
+def mask_secret(value: str) -> str:
     """
-    Renvoie, dans l'ordre de priorité :
-      1) la variable d'environnement (si elle existe sur le panel FadeHost),
-      2) sinon la valeur écrite en dur dans la zone de configuration du fichier.
+    Masque une valeur sensible.
     """
-    valeur = get_env_robuste(nom_env)
-    if valeur:
-        return valeur
-    for autre_nom in (alias or []):
-        valeur = get_env_robuste(autre_nom)
-        if valeur:
-            return valeur
-    return nettoyer_valeur(valeur_config)
+
+    if not value:
+        return "<VIDE>"
+
+    if len(value) <= 10:
+        return "*" * len(value)
+
+    return value[:5] + "..." + value[-5:]
 
 
-def corriger_url_wss(url: str) -> str:
-    """Corrige les erreurs de copier-coller classiques dans une URL WSS."""
-    if not url:
-        return url
-    url = re.sub(r"^wss:/+:*/*", "wss://", url)
-    url = re.sub(r"^(wss://)/+", r"\1", url)
-    return url
+def mask_wss(value: str) -> str:
+    """
+    Masque la clé API Alchemy présente dans l'URL.
+    """
+
+    if not value:
+        return "<VIDE>"
+
+    return re.sub(
+        r"/v2/[^/?#]+",
+        "/v2/********",
+        value,
+        flags=re.IGNORECASE,
+    )
 
 
-def debug_environnement() -> None:
-    """Liste les variables d'environnement au démarrage, secrets masqués."""
-    logger.info("=" * 70)
-    logger.info("DÉBOGAGE DES VARIABLES D'ENVIRONNEMENT (panel FadeHost)")
-    logger.info(f"({len(os.environ)} variable(s) détectée(s) au total dans ce processus)")
-    logger.info("=" * 70)
-    mots_sensibles = ("TOKEN", "KEY", "WSS", "SECRET", "URL", "PASS")
-    for cle in sorted(os.environ.keys()):
-        valeur_brute = os.environ[cle]
-        valeur_propre = nettoyer_valeur(valeur_brute)
-        if any(mot in cle.upper() for mot in mots_sensibles):
-            apercu = f"{valeur_propre[:6]}...{valeur_propre[-4:]}" if len(valeur_propre) > 12 else "***"
-            logger.info(f"  {cle:<25} -> [{len(valeur_propre)} car.] {apercu}")
-        else:
-            logger.info(f"  {cle:<25} -> {valeur_brute}")
-    logger.info("=" * 70)
+# ============================================================
+# VARIABLES FADEHOST
+# ============================================================
+
+DISCORD_TOKEN = get_env("DISCORD_TOKEN")
+
+WSS_NODE_URL = get_env("WSS_NODE_URL")
+
+ALERT_CHANNEL_RAW = get_env("ALERT_CHANNEL_ID")
+
+LARGE_BUY_RAW = get_env("LARGE_BUY_ETH")
+
+INSIDER_WALLETS_RAW = get_env("INSIDER_WALLETS")
 
 
-# --- Chargement effectif de la config (env var prioritaire, sinon zone config) ---
+# ============================================================
+# SEUIL GROS ACHAT
+# ============================================================
 
-DISCORD_TOKEN = charger_config("DISCORD_TOKEN", DISCORD_TOKEN_CONFIG)
+try:
 
-WSS_NODE_URL = corriger_url_wss(charger_config(
-    "WSS_NODE_URL", WSS_NODE_URL_CONFIG,
-    alias=["WSS_URL", "ALCHEMY_WSS_URL", "ALCHEMY_WS_URL", "RPC_WSS_URL"],
-))
+    LARGE_BUY_ETH = float(
+        LARGE_BUY_RAW
+    ) if LARGE_BUY_RAW else DEFAULT_LARGE_BUY_ETH
 
-DISCORD_CHANNEL_ID = charger_config("DISCORD_CHANNEL_ID", DISCORD_CHANNEL_ID_CONFIG)
+except ValueError:
 
-INSIDER_WALLETS = [
-    w.strip().lower()
-    for w in charger_config("INSIDER_WALLETS", INSIDER_WALLETS_CONFIG).split(",")
-    if w.strip()
-]
+    LARGE_BUY_ETH = DEFAULT_LARGE_BUY_ETH
 
-SEUIL_GROS_ACHAT_ETH = float(
-    charger_config("SEUIL_GROS_ACHAT_ETH", SEUIL_GROS_ACHAT_ETH_CONFIG) or "5"
+
+# ============================================================
+# CHANNEL DISCORD
+# ============================================================
+
+ALERT_CHANNEL_ID: Optional[int] = None
+
+if ALERT_CHANNEL_RAW:
+
+    try:
+
+        ALERT_CHANNEL_ID = int(
+            ALERT_CHANNEL_RAW
+        )
+
+    except ValueError:
+
+        logger.warning(
+            "ALERT_CHANNEL_ID invalide : %s",
+            ALERT_CHANNEL_RAW,
+        )
+
+        ALERT_CHANNEL_ID = None
+
+
+# ============================================================
+# WALLETS INSIDER OPTIONNELS
+# ============================================================
+
+INSIDER_WALLETS: Set[str] = set()
+
+if INSIDER_WALLETS_RAW:
+
+    for wallet in INSIDER_WALLETS_RAW.split(","):
+
+        wallet = clean_text(wallet).lower()
+
+        if re.fullmatch(
+            r"0x[a-f0-9]{40}",
+            wallet,
+        ):
+
+            INSIDER_WALLETS.add(wallet)
+
+
+# ============================================================
+# DIAGNOSTIC ENVIRONNEMENT
+# ============================================================
+
+logger.info("=" * 70)
+
+logger.info(
+    "DÉBOGAGE DES VARIABLES D'ENVIRONNEMENT"
+)
+
+logger.info(
+    "(les secrets sont masqués)"
+)
+
+logger.info("=" * 70)
+
+for key in sorted(os.environ.keys()):
+
+    normalized = normalize_key(key)
+
+    value = clean_text(
+        os.environ.get(key, "")
+    )
+
+    if normalized == "DISCORD_TOKEN":
+
+        displayed = mask_secret(value)
+
+    elif normalized == "WSS_NODE_URL":
+
+        displayed = mask_wss(value)
+
+    elif "TOKEN" in normalized or "KEY" in normalized:
+
+        displayed = mask_secret(value)
+
+    else:
+
+        displayed = value[:120]
+
+    logger.info(
+        "  %-30s -> %s",
+        normalized,
+        displayed,
+    )
+
+logger.info("=" * 70)
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+if not DISCORD_TOKEN:
+
+    raise RuntimeError(
+        "DISCORD_TOKEN introuvable dans FadeHost."
+    )
+
+
+if not WSS_NODE_URL:
+
+    raise RuntimeError(
+        "WSS_NODE_URL introuvable dans FadeHost."
+    )
+
+
+if not (
+    WSS_NODE_URL.startswith("wss://")
+    or WSS_NODE_URL.startswith("ws://")
+):
+
+    raise RuntimeError(
+        "WSS_NODE_URL invalide. "
+        "Elle doit commencer par wss:// ou ws://."
+    )
+
+
+logger.info(
+    "🌐 URL WSS utilisée : %s",
+    mask_wss(WSS_NODE_URL),
+)
+
+logger.info(
+    "🕵️ %s wallet(s) insider(s) surveillé(s).",
+    len(INSIDER_WALLETS),
+)
+
+logger.info(
+    "💰 Seuil de gros achat : %.2f ETH",
+    LARGE_BUY_ETH,
+)
+
+logger.info(
+    "✅ Configuration validée."
+)
+
+logger.info(
+    "🚀 Mode MEMPOOL LIVE activé."
 )
 
 
-def verifier_configuration() -> None:
-    """Arrête proprement le bot si la config essentielle manque, avec un message clair."""
-    erreurs = []
-    if not DISCORD_TOKEN:
-        erreurs.append(
-            "DISCORD_TOKEN manquant : remplis DISCORD_TOKEN_CONFIG en haut du fichier, "
-            "ou définis DISCORD_TOKEN dans les variables d'environnement FadeHost."
-        )
-    if not WSS_NODE_URL or not WSS_NODE_URL.startswith("wss://"):
-        erreurs.append(
-            "WSS_NODE_URL manquant ou invalide : remplis WSS_NODE_URL_CONFIG en haut du "
-            "fichier avec une URL commençant par 'wss://' (pas 'https://'), ou définis "
-            "WSS_NODE_URL dans les variables d'environnement FadeHost."
-        )
-    if erreurs:
-        for e in erreurs:
-            logger.error(f"❌ {e}")
-        logger.error("⛔ Configuration invalide -> arrêt.")
-        sys.exit(1)
+# ============================================================
+# DISCORD INTENTS
+# ============================================================
 
+intents = discord.Intents.default()
 
-# ------------------------------------------------------------------------------
-# 3. DÉTECTION ON-CHAIN (routeurs DEX connus + sélecteurs de fonctions)
-# ------------------------------------------------------------------------------
-
-ADRESSES_ROUTEURS_DEX = {
-    "0x7a250d5630b4cf539739df2c5dacb4c659f2488": "Uniswap V2 Router",
-    "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45": "Uniswap V3 Router",
-    "0xe592427a0aece92de3edee1f18e0157c05861564": "Uniswap V3 Router 2",
-}
-
-SELECTEURS_ACHAT = {
-    "0x7ff36ab5": "swapExactETHForTokens",
-    "0xfb3bdb41": "swapETHForExactTokens",
-    "0xb6f9de95": "swapExactETHForTokensSupportingFeeOnTransferTokens",
-}
-
-SELECTEURS_RETRAIT_LIQUIDITE = {
-    "0x02751cad": "removeLiquidityETH",
-    "0xaf2979eb": "removeLiquidityETHSupportingFeeOnTransferTokens",
-    "0xbaa2abde": "removeLiquidity",
-    "0xded9382a": "removeLiquidityETHWithPermit",
-}
-
-
-def decoder_adresse_param(data_hex: str, index_mot: int) -> str | None:
-    """Extrait une adresse (32 octets, alignée à droite) à la position 'index_mot' du calldata."""
-    try:
-        debut = 10 + index_mot * 64
-        morceau = data_hex[debut:debut + 64]
-        return "0x" + morceau[-40:]
-    except (IndexError, ValueError):
-        return None
-
-
-def decoder_token_depuis_swap(data_hex: str) -> str | None:
-    """Décode l'adresse du token acheté (dernier élément du tableau 'path' du calldata)."""
-    try:
-        offset_hex = data_hex[10 + 64:10 + 128]
-        offset_octets = int(offset_hex, 16)
-        position = 10 + offset_octets * 2
-        longueur = int(data_hex[position:position + 64], 16)
-        dernier_index = longueur - 1
-        debut_dernier = position + 64 + dernier_index * 64
-        morceau = data_hex[debut_dernier:debut_dernier + 64]
-        return "0x" + morceau[-40:]
-    except (IndexError, ValueError):
-        return None
-
-
-def analyser_transaction(tx: dict) -> dict | None:
-    """Analyse une transaction en attente et retourne une alerte si pertinente."""
-    try:
-        vers = (tx.get("to") or "").lower()
-        de = (tx.get("from") or "").lower()
-        data = tx.get("input") or "0x"
-        selecteur = data[:10] if len(data) >= 10 else ""
-        valeur_wei = int(tx.get("value", "0x0"), 16)
-        valeur_eth = valeur_wei / 10**18
-
-        if de in INSIDER_WALLETS:
-            return {
-                "type": "insider",
-                "titre": "🕵️ Wallet Insider Détecté !",
-                "couleur": 0xF1C40F,
-                "hash": tx.get("hash"),
-                "wallet": de,
-                "cible": vers,
-                "valeur_eth": valeur_eth,
-                "token": None,
-            }
-
-        if selecteur in SELECTEURS_RETRAIT_LIQUIDITE and vers in ADRESSES_ROUTEURS_DEX:
-            return {
-                "type": "rug_pull",
-                "titre": "🚨 ALERTE RUG PULL POTENTIEL 🚨",
-                "couleur": 0xE74C3C,
-                "hash": tx.get("hash"),
-                "wallet": de,
-                "cible": vers,
-                "methode": SELECTEURS_RETRAIT_LIQUIDITE[selecteur],
-                "valeur_eth": valeur_eth,
-                "token": decoder_adresse_param(data, 0),
-            }
-
-        if selecteur in SELECTEURS_ACHAT and vers in ADRESSES_ROUTEURS_DEX and valeur_eth >= SEUIL_GROS_ACHAT_ETH:
-            return {
-                "type": "gros_achat",
-                "titre": "💰 Gros Achat Détecté !",
-                "couleur": 0x2ECC71,
-                "hash": tx.get("hash"),
-                "wallet": de,
-                "cible": vers,
-                "valeur_eth": valeur_eth,
-                "token": decoder_token_depuis_swap(data),
-            }
-
-    except (ValueError, TypeError, KeyError) as erreur:
-        logger.debug(f"Transaction ignorée (parsing) : {erreur}")
-
-    return None
-
-
-# ------------------------------------------------------------------------------
-# 4. ÉCOUTE MEMPOOL EN DIRECT (tâche de fond asyncio, non bloquante)
-# ------------------------------------------------------------------------------
-
-async def ecouter_mempool(file_alertes: asyncio.Queue) -> None:
-    """
-    Se connecte en boucle infinie au flux WSS d'Alchemy et analyse chaque
-    transaction en attente. Reconnexion automatique avec backoff exponentiel.
-    """
-    delai_reconnexion = 5
-
-    while True:
-        try:
-            logger.info("🔌 Connexion au flux WSS Alchemy...")
-            async with websockets.connect(
-                WSS_NODE_URL,
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=10,
-                max_size=2**20,  # 1 Mo max par message -> protège les 256 Mo de RAM
-            ) as ws:
-                logger.info("✅ Connecté en direct à la Mempool Ethereum (Alchemy).")
-                delai_reconnexion = 5
-
-                abonnement = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "eth_subscribe",
-                    "params": ["alchemyPendingTransactions", {"hashesOnly": False}],
-                }
-                await ws.send(json.dumps(abonnement))
-
-                async for message in ws:
-                    try:
-                        donnees = json.loads(message)
-                        tx = donnees.get("params", {}).get("result")
-                        if not tx:
-                            continue
-                        alerte = analyser_transaction(tx)
-                        if alerte:
-                            if file_alertes.full():
-                                file_alertes.get_nowait()
-                            await file_alertes.put(alerte)
-                    except json.JSONDecodeError:
-                        continue
-
-        except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as erreur:
-            logger.warning(f"⚠️ Connexion WSS perdue ({erreur}). Reconnexion dans {delai_reconnexion}s...")
-        except Exception as erreur:
-            logger.error(f"❌ Erreur inattendue dans l'écoute mempool : {erreur}")
-
-        await asyncio.sleep(delai_reconnexion)
-        delai_reconnexion = min(delai_reconnexion * 2, 60)
-
-
-async def nettoyage_memoire_periodique() -> None:
-    """Libère la mémoire toutes les 10 minutes (utile sur les 256 Mo de RAM de FadeHost)."""
-    while True:
-        await asyncio.sleep(600)
-        objets_liberes = gc.collect()
-        logger.debug(f"🧹 Nettoyage mémoire : {objets_liberes} objets libérés.")
-
-
-# ------------------------------------------------------------------------------
-# 5. EMBEDS DISCORD + BOUTON LIEN DEXSCREENER
-# ------------------------------------------------------------------------------
-
-def construire_embed_alerte(alerte: dict) -> tuple[discord.Embed, discord.ui.View]:
-    """Construit un embed soigné + un bouton lien direct vers DexScreener."""
-    embed = discord.Embed(
-        title=alerte["titre"],
-        color=alerte["couleur"],
-        timestamp=discord.utils.utcnow(),
-    )
-    embed.add_field(name="💼 Wallet", value=f"`{alerte['wallet']}`", inline=False)
-    if alerte.get("token"):
-        embed.add_field(name="🪙 Token ciblé", value=f"`{alerte['token']}`", inline=False)
-    embed.add_field(name="💎 Valeur", value=f"{alerte['valeur_eth']:.4f} ETH", inline=True)
-    if alerte.get("methode"):
-        embed.add_field(name="⚙️ Méthode", value=f"`{alerte['methode']}`", inline=True)
-    embed.add_field(
-        name="🔗 Transaction",
-        value=f"[Voir sur Etherscan](https://etherscan.io/tx/{alerte['hash']})",
-        inline=False,
-    )
-    embed.set_footer(text="Bot Sentinelle Mempool • Flux Alchemy en direct")
-
-    token_pour_lien = alerte.get("token") or alerte.get("cible")
-    url_dexscreener = f"https://dexscreener.com/ethereum/{token_pour_lien}"
-
-    vue = discord.ui.View()
-    vue.add_item(discord.ui.Button(
-        label="📈 Trader sur DexScreener",
-        style=discord.ButtonStyle.link,
-        url=url_dexscreener,
-    ))
-    return embed, vue
-
-
-async def expediteur_alertes(bot: "BotTradingMemecoins") -> None:
-    """Consomme la file d'alertes et envoie l'embed correspondant sur Discord."""
-    await bot.wait_until_ready()
-    while True:
-        alerte = await bot.file_alertes.get()
-        try:
-            if bot.canal_alertes is None:
-                logger.warning("⚠️ Alerte reçue mais DISCORD_CHANNEL_ID n'est pas configuré/valide.")
-                continue
-            embed, vue = construire_embed_alerte(alerte)
-            await bot.canal_alertes.send(embed=embed, view=vue)
-        except discord.HTTPException as erreur:
-            logger.error(f"❌ Échec de l'envoi de l'embed Discord : {erreur}")
-        finally:
-            bot.file_alertes.task_done()
-
-
-# ------------------------------------------------------------------------------
-# 6. BOT DISCORD (discord.py v2)
-# ------------------------------------------------------------------------------
-
-intents = discord.Intents.none()
 intents.guilds = True
 
-class BotTradingMemecoins(commands.Bot):
-    def __init__(self) -> None:
+# Nécessaire si tu veux utiliser !status.
+# Il faut également activer Message Content Intent
+# dans Discord Developer Portal.
+intents.message_content = True
+
+
+# ============================================================
+# BOT
+# ============================================================
+
+class MempoolBot(commands.Bot):
+
+    def __init__(self):
+
         super().__init__(
             command_prefix="!",
             intents=intents,
-            max_messages=50,
         )
-        self.file_alertes: asyncio.Queue = asyncio.Queue(maxsize=200)
-        self.canal_alertes: discord.TextChannel | None = None
 
-    async def setup_hook(self) -> None:
-        """
-        Point d'entrée officiel de discord.py v2 pour lancer des tâches de fond
-        AVANT la connexion à la gateway. On ne touche jamais à asyncio.run() ici :
-        c'est justement ce qui fait planter les scripts sur FadeHost.
-        """
-        self.loop.create_task(ecouter_mempool(self.file_alertes))
-        self.loop.create_task(expediteur_alertes(self))
-        self.loop.create_task(nettoyage_memoire_periodique())
-        logger.info("🚀 Tâches de fond lancées (écoute mempool + expéditeur + nettoyage RAM).")
+        # ----------------------------------------------------
+        # État général
+        # ----------------------------------------------------
 
-    async def on_ready(self) -> None:
-        logger.info(f"✅ Connecté à Discord en tant que {self.user} (ID: {self.user.id})")
-        if DISCORD_CHANNEL_ID:
+        self.running = False
+
+        self.websocket = None
+
+        self.subscription_id = None
+
+        # ----------------------------------------------------
+        # File Mempool limitée
+        # ----------------------------------------------------
+
+        self.transaction_queue = asyncio.Queue(
+            maxsize=MAX_QUEUE_SIZE
+        )
+
+        # ----------------------------------------------------
+        # Protection doublons
+        # ----------------------------------------------------
+
+        self.seen_transactions: Set[str] = set()
+
+        # ----------------------------------------------------
+        # RPC
+        # ----------------------------------------------------
+
+        self.rpc_waiters: Dict[
+            int,
+            asyncio.Future
+        ] = {}
+
+        self.rpc_semaphore = asyncio.Semaphore(
+            MAX_RPC_REQUESTS
+        )
+
+        self.request_counter = 1000
+
+        # ----------------------------------------------------
+        # Tâches
+        # ----------------------------------------------------
+
+        self.mempool_task = None
+
+        self.receiver_task = None
+
+        self.worker_tasks = []
+
+        # ----------------------------------------------------
+        # Statistiques
+        # ----------------------------------------------------
+
+        self.total_pending_received = 0
+
+        self.total_transactions_processed = 0
+
+        self.total_alerts = 0
+
+
+    # ========================================================
+    # SETUP HOOK
+    # ========================================================
+
+    async def setup_hook(self):
+
+        logger.info(
+            "🚀 Tâches de fond lancées "
+            "(écoute mempool + workers + nettoyage RAM)."
+        )
+
+        # Worker principal de connexion.
+        self.mempool_task = asyncio.create_task(
+            self.mempool_worker(),
+            name="alchemy-mempool-worker",
+        )
+
+        # Workers limités.
+        for number in range(WORKER_COUNT):
+
+            task = asyncio.create_task(
+                self.transaction_worker(
+                    number
+                ),
+                name=f"transaction-worker-{number}",
+            )
+
+            self.worker_tasks.append(task)
+
+
+    # ========================================================
+    # READY
+    # ========================================================
+
+    async def on_ready(self):
+
+        logger.info("=" * 70)
+
+        logger.info(
+            "✅ Connecté à Discord en tant que %s",
+            self.user,
+        )
+
+        logger.info(
+            "🆔 Discord ID : %s",
+            self.user.id if self.user else "?",
+        )
+
+        logger.info(
+            "🌐 Serveur(s) : %s",
+            len(self.guilds),
+        )
+
+        logger.info("=" * 70)
+
+
+    # ========================================================
+    # TROUVER CHANNEL
+    # ========================================================
+
+    async def get_alert_channel(self):
+        """
+        Cherche le channel configuré.
+
+        Si ALERT_CHANNEL_ID est mauvais ou supprimé,
+        le bot essaie automatiquement de trouver un autre
+        channel accessible.
+
+        Cela évite le problème :
+            404 Unknown Channel
+        """
+
+        # ----------------------------------------------------
+        # 1. Channel configuré
+        # ----------------------------------------------------
+
+        if ALERT_CHANNEL_ID:
+
+            channel = self.get_channel(
+                ALERT_CHANNEL_ID
+            )
+
+            if channel:
+
+                try:
+
+                    permissions = channel.permissions_for(
+                        channel.guild.me
+                    )
+
+                    if (
+                        permissions.view_channel
+                        and permissions.send_messages
+                    ):
+
+                        return channel
+
+                except Exception:
+                    pass
+
+            # Tentative API Discord.
             try:
-                self.canal_alertes = await self.fetch_channel(int(DISCORD_CHANNEL_ID))
-                logger.info(f"📡 Canal d'alertes configuré : #{self.canal_alertes}")
-            except (discord.NotFound, discord.Forbidden, ValueError) as erreur:
-                logger.error(f"❌ Impossible de récupérer le canal {DISCORD_CHANNEL_ID} : {erreur}")
+
+                channel = await self.fetch_channel(
+                    ALERT_CHANNEL_ID
+                )
+
+                if channel:
+
+                    return channel
+
+            except discord.NotFound:
+
+                logger.warning(
+                    "⚠️ ALERT_CHANNEL_ID %s "
+                    "n'existe pas. "
+                    "Recherche automatique...",
+                    ALERT_CHANNEL_ID,
+                )
+
+            except discord.Forbidden:
+
+                logger.warning(
+                    "⚠️ Pas accès au channel configuré. "
+                    "Recherche automatique..."
+                )
+
+            except Exception as exc:
+
+                logger.warning(
+                    "⚠️ Erreur channel configuré : %s",
+                    exc,
+                )
+
+
+        # ----------------------------------------------------
+        # 2. Recherche automatique
+        # ----------------------------------------------------
+
+        for guild in self.guilds:
+
+            me = guild.me
+
+            if not me:
+                continue
+
+            for channel in guild.text_channels:
+
+                try:
+
+                    permissions = channel.permissions_for(
+                        me
+                    )
+
+                    if (
+                        permissions.view_channel
+                        and permissions.send_messages
+                        and permissions.embed_links
+                    ):
+
+                        logger.info(
+                            "📢 Channel d'alerte sélectionné : "
+                            "%s / #%s",
+                            guild.name,
+                            channel.name,
+                        )
+
+                        return channel
+
+                except Exception:
+                    continue
+
+
+        logger.error(
+            "❌ Aucun channel Discord accessible "
+            "pour envoyer les alertes."
+        )
+
+        return None
+
+
+    # ========================================================
+    # WORKER MEMPOOL
+    # ========================================================
+
+    async def mempool_worker(self):
+
+        self.running = True
+
+        reconnect_delay = RECONNECT_MIN
+
+        while self.running:
+
+            try:
+
+                logger.info(
+                    "🔌 Connexion au flux WSS Alchemy..."
+                )
+
+                logger.info(
+                    "🌐 %s",
+                    mask_wss(WSS_NODE_URL),
+                )
+
+                async with websockets.connect(
+                    WSS_NODE_URL,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                    max_size=2 * 1024 * 1024,
+                ) as websocket:
+
+                    self.websocket = websocket
+
+                    logger.info(
+                        "✅ Connecté en direct à la "
+                        "Mempool Ethereum (Alchemy)."
+                    )
+
+                    # ------------------------------------------------
+                    # RECEIVER UNIQUE
+                    # ------------------------------------------------
+
+                    self.receiver_task = asyncio.create_task(
+                        self.rpc_receiver(
+                            websocket
+                        ),
+                        name="alchemy-receiver",
+                    )
+
+                    # ------------------------------------------------
+                    # SUBSCRIBE
+                    # ------------------------------------------------
+
+                    subscription_id = await self.rpc_call(
+                        websocket,
+                        "eth_subscribe",
+                        [
+                            "newPendingTransactions"
+                        ],
+                    )
+
+                    if not subscription_id:
+
+                        raise RuntimeError(
+                            "Alchemy n'a pas retourné "
+                            "de subscription ID."
+                        )
+
+                    self.subscription_id = (
+                        subscription_id
+                    )
+
+                    logger.info(
+                        "📡 Abonnement Mempool actif."
+                    )
+
+                    logger.info(
+                        "🆔 Subscription : %s",
+                        subscription_id,
+                    )
+
+                    reconnect_delay = RECONNECT_MIN
+
+                    # ------------------------------------------------
+                    # ATTENDRE LE RECEIVER
+                    # ------------------------------------------------
+
+                    await self.receiver_task
+
+            except asyncio.CancelledError:
+
+                self.running = False
+
+                raise
+
+            except Exception as exc:
+
+                logger.error(
+                    "❌ Connexion Mempool interrompue : %s",
+                    exc,
+                )
+
+                self.websocket = None
+
+                self.subscription_id = None
+
+                # Annulation receiver.
+                if self.receiver_task:
+
+                    if not self.receiver_task.done():
+
+                        self.receiver_task.cancel()
+
+                logger.info(
+                    "🔄 Reconnexion dans %s secondes...",
+                    reconnect_delay,
+                )
+
+                await asyncio.sleep(
+                    reconnect_delay
+                )
+
+                reconnect_delay = min(
+                    reconnect_delay * 2,
+                    RECONNECT_MAX,
+                )
+
+
+    # ========================================================
+    # RECEIVER WEBSOCKET
+    # ========================================================
+
+    async def rpc_receiver(
+        self,
+        websocket,
+    ):
+        """
+        UNE SEULE coroutine utilise recv().
+
+        C'est très important avec websockets.
+        """
+
+        try:
+
+            async for raw_message in websocket:
+
+                try:
+
+                    message = json.loads(
+                        raw_message
+                    )
+
+                except json.JSONDecodeError:
+
+                    continue
+
+
+                # ------------------------------------------------
+                # Réponse RPC
+                # ------------------------------------------------
+
+                message_id = message.get(
+                    "id"
+                )
+
+                if message_id is not None:
+
+                    future = self.rpc_waiters.pop(
+                        message_id,
+                        None,
+                    )
+
+                    if future and not future.done():
+
+                        if "error" in message:
+
+                            future.set_exception(
+                                RuntimeError(
+                                    str(
+                                        message["error"]
+                                    )
+                                )
+                            )
+
+                        else:
+
+                            future.set_result(
+                                message.get(
+                                    "result"
+                                )
+                            )
+
+                    continue
+
+
+                # ------------------------------------------------
+                # Notification subscription
+                # ------------------------------------------------
+
+                params = message.get(
+                    "params"
+                )
+
+                if not params:
+
+                    continue
+
+
+                subscription = params.get(
+                    "subscription"
+                )
+
+                if (
+                    subscription
+                    != self.subscription_id
+                ):
+
+                    continue
+
+
+                tx_hash = params.get(
+                    "result"
+                )
+
+                if not isinstance(
+                    tx_hash,
+                    str,
+                ):
+
+                    continue
+
+
+                self.total_pending_received += 1
+
+
+                # ------------------------------------------------
+                # Protection RAM :
+                # queue limitée.
+                # ------------------------------------------------
+
+                try:
+
+                    self.transaction_queue.put_nowait(
+                        tx_hash
+                    )
+
+                except asyncio.QueueFull:
+
+                    # On préfère abandonner quelques transactions
+                    # plutôt que de faire exploser la RAM.
+                    logger.debug(
+                        "Queue Mempool pleine : "
+                        "transaction ignorée."
+                    )
+
+
+        except asyncio.CancelledError:
+
+            raise
+
+        except Exception as exc:
+
+            logger.error(
+                "❌ Receiver Alchemy arrêté : %s",
+                exc,
+            )
+
+            raise
+
+
+    # ========================================================
+    # WORKER TRANSACTIONS
+    # ========================================================
+
+    async def transaction_worker(
+        self,
+        worker_id: int,
+    ):
+
+        logger.info(
+            "⚙️ Worker Mempool #%s démarré.",
+            worker_id,
+        )
+
+        while True:
+
+            try:
+
+                tx_hash = await self.transaction_queue.get()
+
+                try:
+
+                    await self.process_transaction_hash(
+                        tx_hash
+                    )
+
+                except Exception as exc:
+
+                    logger.debug(
+                        "Worker #%s : %s",
+                        worker_id,
+                        exc,
+                    )
+
+                finally:
+
+                    self.transaction_queue.task_done()
+
+            except asyncio.CancelledError:
+
+                raise
+
+
+    # ========================================================
+    # RPC
+    # ========================================================
+
+    async def rpc_call(
+        self,
+        websocket,
+        method: str,
+        params: list,
+    ):
+
+        async with self.rpc_semaphore:
+
+            self.request_counter += 1
+
+            request_id = (
+                self.request_counter
+            )
+
+            loop = asyncio.get_running_loop()
+
+            future = loop.create_future()
+
+            self.rpc_waiters[
+                request_id
+            ] = future
+
+
+            request = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            }
+
+
+            try:
+
+                await websocket.send(
+                    json.dumps(
+                        request
+                    )
+                )
+
+                result = await asyncio.wait_for(
+                    future,
+                    timeout=RPC_TIMEOUT,
+                )
+
+                return result
+
+            except Exception:
+
+                self.rpc_waiters.pop(
+                    request_id,
+                    None,
+                )
+
+                raise
+
+
+    # ========================================================
+    # RÉCUPÉRATION TRANSACTION
+    # ========================================================
+
+    async def process_transaction_hash(
+        self,
+        tx_hash: str,
+    ):
+
+        if tx_hash in self.seen_transactions:
+
+            return
+
+
+        self.seen_transactions.add(
+            tx_hash
+        )
+
+
+        # ----------------------------------------------------
+        # Protection RAM
+        # ----------------------------------------------------
+
+        if len(
+            self.seen_transactions
+        ) > MAX_SEEN_TRANSACTIONS:
+
+            # On retire un bloc d'anciennes entrées.
+            for _ in range(500):
+
+                try:
+
+                    self.seen_transactions.pop()
+
+                except KeyError:
+
+                    break
+
+
+        websocket = self.websocket
+
+        if not websocket:
+
+            return
+
+
+        try:
+
+            tx = await self.rpc_call(
+                websocket,
+                "eth_getTransactionByHash",
+                [
+                    tx_hash
+                ],
+            )
+
+        except Exception:
+
+            return
+
+
+        if not tx:
+
+            return
+
+
+        self.total_transactions_processed += 1
+
+
+        await self.analyze_transaction(
+            tx
+        )
+
+
+    # ========================================================
+    # ANALYSE TRANSACTION
+    # ========================================================
+
+    async def analyze_transaction(
+        self,
+        tx: Dict[str, Any],
+    ):
+
+        calldata = tx.get(
+            "input"
+        ) or ""
+
+        if not calldata:
+
+            return
+
+
+        calldata = calldata.lower()
+
+        selector = calldata[:10]
+
+
+        # ----------------------------------------------------
+        # Wallet expéditeur
+        # ----------------------------------------------------
+
+        sender = (
+            tx.get(
+                "from"
+            )
+            or ""
+        ).lower()
+
+
+        # ----------------------------------------------------
+        # Valeur ETH
+        # ----------------------------------------------------
+
+        try:
+
+            value_wei = int(
+                tx.get(
+                    "value",
+                    "0x0",
+                ),
+                16,
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            value_wei = 0
+
+
+        value_eth = (
+            value_wei / 10**18
+        )
+
+
+        # ====================================================
+        # SIGNATURES ACHATS
+        # ====================================================
+
+        BUY_METHODS = {
+
+            "0x7ff36ab5":
+                "swapExactETHForTokens",
+
+            "0xb6f9de95":
+                "swapExactETHForTokensSupportingFeeOnTransferTokens",
+
+            "0xfb3bdb41":
+                "swapETHForExactTokens",
+        }
+
+
+        # ====================================================
+        # SIGNATURES RETRAIT LIQUIDITÉ
+        # ====================================================
+
+        LIQUIDITY_METHODS = {
+
+            "0x02751cec":
+                "removeLiquidity",
+
+            "0xbaa2abde":
+                "removeLiquidityETH",
+
+            "0xaf2979eb":
+                "removeLiquidityETHSupportingFeeOnTransferTokens",
+
+            "0x2195995c":
+                "removeLiquidityWithPermit",
+
+            "0xded9382a":
+                "removeLiquidityETHWithPermit",
+
+            "0x5b0d5984":
+                "removeLiquidityETHWithPermitSupportingFeeOnTransferTokens",
+        }
+
+
+        # ====================================================
+        # RETRAIT LIQUIDITÉ
+        # ====================================================
+
+        if selector in LIQUIDITY_METHODS:
+
+            method = LIQUIDITY_METHODS[
+                selector
+            ]
+
+            token = extract_first_address(
+                calldata
+            )
+
+            await self.send_liquidity_alert(
+                tx=tx,
+                method=method,
+                token=token,
+            )
+
+            return
+
+
+        # ====================================================
+        # ACHAT
+        # ====================================================
+
+        if selector not in BUY_METHODS:
+
+            return
+
+
+        # ----------------------------------------------------
+        # Vérification gros achat
+        # ----------------------------------------------------
+
+        is_large_buy = (
+            value_eth >= LARGE_BUY_ETH
+        )
+
+
+        # ----------------------------------------------------
+        # Vérification wallet insider
+        # ----------------------------------------------------
+
+        is_insider = (
+            sender in INSIDER_WALLETS
+        )
+
+
+        # ----------------------------------------------------
+        # On ne déclenche que si :
+        #
+        # gros achat
+        # OU
+        # wallet surveillé
+        # ----------------------------------------------------
+
+        if not (
+            is_large_buy
+            or is_insider
+        ):
+
+            return
+
+
+        token = extract_v2_last_token(
+            calldata
+        )
+
+
+        await self.send_buy_alert(
+            tx=tx,
+            method=BUY_METHODS[selector],
+            token=token,
+            eth_value=value_eth,
+            is_insider=is_insider,
+        )
+
+
+    # ========================================================
+    # ALERTE ACHAT
+    # ========================================================
+
+    async def send_buy_alert(
+        self,
+        tx: Dict[str, Any],
+        method: str,
+        token: Optional[str],
+        eth_value: float,
+        is_insider: bool,
+    ):
+
+        channel = await self.get_alert_channel()
+
+        if not channel:
+
+            return
+
+
+        tx_hash = tx.get(
+            "hash",
+            "unknown",
+        )
+
+        sender = tx.get(
+            "from",
+            "unknown",
+        )
+
+
+        # ----------------------------------------------------
+        # Titre
+        # ----------------------------------------------------
+
+        if is_insider:
+
+            title = "🕵️ INSIDER BUY DETECTED"
+
+            colour = discord.Colour.purple()
+
         else:
-            logger.warning("⚠️ DISCORD_CHANNEL_ID non défini : aucune alerte ne pourra être envoyée.")
+
+            title = "🐋 LARGE MEMPOOL BUY"
+
+            colour = discord.Colour.gold()
 
 
-# ------------------------------------------------------------------------------
-# 7. POINT D'ENTRÉE
-# ------------------------------------------------------------------------------
+        embed = discord.Embed(
+            title=title,
+            description=(
+                "Transaction d'achat détectée "
+                "dans la mempool Ethereum."
+            ),
+            colour=colour,
+        )
+
+
+        # ----------------------------------------------------
+        # Montant
+        # ----------------------------------------------------
+
+        embed.add_field(
+            name="💰 Montant",
+            value=(
+                f"**{eth_value:,.4f} ETH**"
+            ),
+            inline=True,
+        )
+
+
+        # ----------------------------------------------------
+        # Méthode
+        # ----------------------------------------------------
+
+        embed.add_field(
+            name="🔄 Méthode",
+            value=f"`{method}`",
+            inline=True,
+        )
+
+
+        # ----------------------------------------------------
+        # Wallet
+        # ----------------------------------------------------
+
+        embed.add_field(
+            name="👤 Wallet",
+            value=(
+                f"`{short_address(sender)}`"
+            ),
+            inline=False,
+        )
+
+
+        # ----------------------------------------------------
+        # Transaction
+        # ----------------------------------------------------
+
+        embed.add_field(
+            name="🧾 Transaction",
+            value=(
+                f"`{short_hash(tx_hash)}`"
+            ),
+            inline=False,
+        )
+
+
+        view = None
+
+
+        # ----------------------------------------------------
+        # Token
+        # ----------------------------------------------------
+
+        if token:
+
+            embed.add_field(
+                name="🪙 Token détecté",
+                value=f"`{token}`",
+                inline=False,
+            )
+
+
+            dex_url = (
+                "https://dexscreener.com/ethereum/"
+                + token
+            )
+
+
+            view = discord.ui.View(
+                timeout=None
+            )
+
+
+            view.add_item(
+                discord.ui.Button(
+                    label="📈 Ouvrir DexScreener",
+                    style=discord.ButtonStyle.link,
+                    url=dex_url,
+                )
+            )
+
+
+        # ----------------------------------------------------
+        # Footer
+        # ----------------------------------------------------
+
+        embed.set_footer(
+            text=(
+                "Ethereum Mainnet • "
+                "Alchemy Pending Mempool"
+            )
+        )
+
+
+        try:
+
+            await channel.send(
+                embed=embed,
+                view=view,
+            )
+
+            self.total_alerts += 1
+
+            logger.info(
+                "🚨 Alerte achat envoyée | "
+                "%.4f ETH | %s",
+                eth_value,
+                tx_hash,
+            )
+
+        except discord.Forbidden:
+
+            logger.error(
+                "❌ Discord refuse l'envoi dans #%s.",
+                getattr(
+                    channel,
+                    "name",
+                    "unknown",
+                ),
+            )
+
+        except Exception as exc:
+
+            logger.error(
+                "❌ Erreur envoi alerte : %s",
+                exc,
+            )
+
+
+    # ========================================================
+    # ALERTE RETRAIT LIQUIDITÉ
+    # ========================================================
+
+    async def send_liquidity_alert(
+        self,
+        tx: Dict[str, Any],
+        method: str,
+        token: Optional[str],
+    ):
+
+        channel = await self.get_alert_channel()
+
+        if not channel:
+
+            return
+
+
+        tx_hash = tx.get(
+            "hash",
+            "unknown",
+        )
+
+        sender = tx.get(
+            "from",
+            "unknown",
+        )
+
+
+        embed = discord.Embed(
+            title="🚨 LIQUIDITY REMOVAL DETECTED",
+            description=(
+                "Une transaction correspondant à "
+                "une fonction connue de retrait de "
+                "liquidité a été détectée."
+            ),
+            colour=discord.Colour.red(),
+        )
+
+
+        embed.add_field(
+            name="⚠️ Méthode",
+            value=f"`{method}`",
+            inline=True,
+        )
+
+
+        embed.add_field(
+            name="👤 Wallet",
+            value=(
+                f"`{short_address(sender)}`"
+            ),
+            inline=True,
+        )
+
+
+        embed.add_field(
+            name="🧾 Transaction",
+            value=(
+                f"`{short_hash(tx_hash)}`"
+            ),
+            inline=False,
+        )
+
+
+        view = None
+
+
+        if token:
+
+            embed.add_field(
+                name="🪙 Token potentiel",
+                value=f"`{token}`",
+                inline=False,
+            )
+
+
+            dex_url = (
+                "https://dexscreener.com/ethereum/"
+                + token
+            )
+
+
+            view = discord.ui.View(
+                timeout=None
+            )
+
+
+            view.add_item(
+                discord.ui.Button(
+                    label="📉 Vérifier sur DexScreener",
+                    style=discord.ButtonStyle.link,
+                    url=dex_url,
+                )
+            )
+
+
+        embed.set_footer(
+            text=(
+                "Ethereum Mainnet • "
+                "Liquidity Monitor"
+            )
+        )
+
+
+        try:
+
+            await channel.send(
+                embed=embed,
+                view=view,
+            )
+
+            self.total_alerts += 1
+
+            logger.warning(
+                "🚨 LIQUIDITY REMOVAL détecté : %s",
+                tx_hash,
+            )
+
+        except discord.Forbidden:
+
+            logger.error(
+                "❌ Discord refuse l'envoi "
+                "dans le channel."
+            )
+
+        except Exception as exc:
+
+            logger.error(
+                "❌ Erreur alerte liquidity : %s",
+                exc,
+            )
+
+
+    # ========================================================
+    # NETTOYAGE RAM
+    # ========================================================
+
+    async def memory_cleanup_loop(self):
+
+        while True:
+
+            try:
+
+                await asyncio.sleep(
+                    300
+                )
+
+                # Nettoyage des hashes.
+                if len(
+                    self.seen_transactions
+                ) > MAX_SEEN_TRANSACTIONS:
+
+                    self.seen_transactions.clear()
+
+                    logger.info(
+                        "🧹 Cache transactions nettoyé."
+                    )
+
+
+                # Nettoyage RPC futures.
+                stale = []
+
+                for request_id, future in list(
+                    self.rpc_waiters.items()
+                ):
+
+                    if future.done():
+
+                        stale.append(
+                            request_id
+                        )
+
+
+                for request_id in stale:
+
+                    self.rpc_waiters.pop(
+                        request_id,
+                        None,
+                    )
+
+
+            except asyncio.CancelledError:
+
+                raise
+
+            except Exception as exc:
+
+                logger.debug(
+                    "Cleanup : %s",
+                    exc,
+                )
+
+
+    # ========================================================
+    # SHUTDOWN
+    # ========================================================
+
+    async def close(self):
+
+        logger.info(
+            "🛑 Arrêt du bot..."
+        )
+
+        self.running = False
+
+
+        # ----------------------------------------------------
+        # Mempool
+        # ----------------------------------------------------
+
+        if self.mempool_task:
+
+            self.mempool_task.cancel()
+
+            try:
+
+                await self.mempool_task
+
+            except (
+                asyncio.CancelledError,
+                Exception,
+            ):
+
+                pass
+
+
+        # ----------------------------------------------------
+        # Receiver
+        # ----------------------------------------------------
+
+        if self.receiver_task:
+
+            if not self.receiver_task.done():
+
+                self.receiver_task.cancel()
+
+                try:
+
+                    await self.receiver_task
+
+                except (
+                    asyncio.CancelledError,
+                    Exception,
+                ):
+
+                    pass
+
+
+        # ----------------------------------------------------
+        # Workers
+        # ----------------------------------------------------
+
+        for task in self.worker_tasks:
+
+            if not task.done():
+
+                task.cancel()
+
+
+        for task in self.worker_tasks:
+
+            try:
+
+                await task
+
+            except (
+                asyncio.CancelledError,
+                Exception,
+            ):
+
+                pass
+
+
+        self.websocket = None
+
+        await super().close()
+
+
+# ============================================================
+# OUTILS
+# ============================================================
+
+def short_address(
+    address: str,
+) -> str:
+
+    if not address:
+
+        return "unknown"
+
+    if len(address) <= 14:
+
+        return address
+
+    return (
+        address[:8]
+        + "..."
+        + address[-6:]
+    )
+
+
+def short_hash(
+    tx_hash: str,
+) -> str:
+
+    if not tx_hash:
+
+        return "unknown"
+
+    if len(tx_hash) <= 18:
+
+        return tx_hash
+
+    return (
+        tx_hash[:10]
+        + "..."
+        + tx_hash[-8:]
+    )
+
+
+def extract_first_address(
+    calldata: str,
+) -> Optional[str]:
+    """
+    Extrait la première adresse ABI.
+    """
+
+    try:
+
+        data = calldata[10:]
+
+        if len(data) < 64:
+
+            return None
+
+
+        word = data[:64]
+
+        address = (
+            "0x"
+            + word[-40:]
+        )
+
+
+        if not re.fullmatch(
+            r"0x[a-f0-9]{40}",
+            address,
+        ):
+
+            return None
+
+
+        if int(
+            address[2:],
+            16,
+        ) == 0:
+
+            return None
+
+
+        return address
+
+    except Exception:
+
+        return None
+
+
+def extract_v2_last_token(
+    calldata: str,
+) -> Optional[str]:
+    """
+    Tente de décoder le dernier token d'un path
+    de type Uniswap V2.
+
+    Utilisé pour les fonctions :
+
+        swapExactETHForTokens
+        swapExactETHForTokensSupportingFeeOnTransferTokens
+        swapETHForExactTokens
+    """
+
+    try:
+
+        data = calldata[10:]
+
+        if len(data) < 128:
+
+            return None
+
+
+        words = [
+            data[i:i + 64]
+            for i in range(
+                0,
+                len(data),
+                64,
+            )
+        ]
+
+
+        # Deuxième argument :
+        # offset vers le tableau path.
+        path_offset = int(
+            words[1],
+            16,
+        )
+
+
+        if path_offset % 32 != 0:
+
+            return None
+
+
+        path_index = (
+            path_offset // 32
+        )
+
+
+        if path_index >= len(words):
+
+            return None
+
+
+        path_length = int(
+            words[path_index],
+            16,
+        )
+
+
+        # Protection contre des valeurs aberrantes.
+        if not (
+            2 <= path_length <= 20
+        ):
+
+            return None
+
+
+        last_index = (
+            path_index
+            + 1
+            + path_length
+            - 1
+        )
+
+
+        if last_index >= len(words):
+
+            return None
+
+
+        token_word = words[
+            last_index
+        ]
+
+
+        token = (
+            "0x"
+            + token_word[-40:]
+        )
+
+
+        if not re.fullmatch(
+            r"0x[a-f0-9]{40}",
+            token,
+        ):
+
+            return None
+
+
+        if int(
+            token[2:],
+            16,
+        ) == 0:
+
+            return None
+
+
+        return token
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# INSTANCE
+# ============================================================
+
+bot = MempoolBot()
+
+
+# ============================================================
+# COMMANDE STATUS
+# ============================================================
+
+@bot.command(
+    name="status"
+)
+@commands.guild_only()
+async def status(
+    ctx: commands.Context,
+):
+
+    embed = discord.Embed(
+        title="🟢 Double Mind — Mempool Monitor",
+        description=(
+            "Le moteur Ethereum Mainnet est actif."
+        ),
+        colour=discord.Colour.green(),
+    )
+
+
+    embed.add_field(
+        name="Discord",
+        value="🟢 ONLINE",
+        inline=True,
+    )
+
+
+    embed.add_field(
+        name="Alchemy",
+        value="🟢 CONNECTÉ",
+        inline=True,
+    )
+
+
+    embed.add_field(
+        name="Mempool",
+        value=(
+            "🟢 LIVE"
+            if bot.running
+            else "🔴 OFF"
+        ),
+        inline=True,
+    )
+
+
+    embed.add_field(
+        name="Transactions reçues",
+        value=str(
+            bot.total_pending_received
+        ),
+        inline=True,
+    )
+
+
+    embed.add_field(
+        name="Transactions analysées",
+        value=str(
+            bot.total_transactions_processed
+        ),
+        inline=True,
+    )
+
+
+    embed.add_field(
+        name="Alertes",
+        value=str(
+            bot.total_alerts
+        ),
+        inline=True,
+    )
+
+
+    embed.add_field(
+        name="File Mempool",
+        value=(
+            f"{bot.transaction_queue.qsize()}"
+            f"/{MAX_QUEUE_SIZE}"
+        ),
+        inline=True,
+    )
+
+
+    embed.set_footer(
+        text=(
+            "Ethereum Mainnet • "
+            "Alchemy WSS"
+        )
+    )
+
+
+    await ctx.send(
+        embed=embed
+    )
+
+
+# ============================================================
+# COMMANDE TEST
+# ============================================================
+
+@bot.command(
+    name="testalert"
+)
+@commands.guild_only()
+async def test_alert(
+    ctx: commands.Context,
+):
+    """
+    Teste uniquement l'envoi Discord.
+    """
+
+    embed = discord.Embed(
+        title="🧪 TEST MEMPOOL",
+        description=(
+            "Le système d'alerte Discord fonctionne."
+        ),
+        colour=discord.Colour.blue(),
+    )
+
+    embed.add_field(
+        name="Alchemy",
+        value="🟢 WSS configuré",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Discord",
+        value="🟢 Channel accessible",
+        inline=True,
+    )
+
+    await ctx.send(
+        embed=embed
+    )
+
+
+# ============================================================
+# DÉMARRAGE PRODUCTION
+# ============================================================
 
 if __name__ == "__main__":
-    debug_environnement()
-    verifier_configuration()
-    logger.info(f"🌐 URL WSS utilisée (nettoyée) : {WSS_NODE_URL[:25]}...")
-    logger.info(f"🕵️ {len(INSIDER_WALLETS)} wallet(s) insider(s) surveillé(s).")
-    logger.info(f"💰 Seuil de gros achat : {SEUIL_GROS_ACHAT_ETH} ETH")
 
-    bot = BotTradingMemecoins()
+    logger.info("=" * 70)
 
-    # IMPORTANT : bot.run() est BLOQUANT et gère sa propre boucle asyncio en
-    # interne. Ne JAMAIS l'entourer d'asyncio.run() -> c'est ce qui coupe le
-    # script sur FadeHost. Les tâches de fond démarrent via setup_hook().
-    try:
-        bot.run(DISCORD_TOKEN, log_handler=None)
-    except discord.LoginFailure:
-        logger.error("❌ DISCORD_TOKEN invalide : vérifie DISCORD_TOKEN_CONFIG ou la variable FadeHost.")
-        sys.exit(1)
+    logger.info(
+        "🚀 DOUBLE MIND — ETHEREUM MEMPOOL BOT"
+    )
+
+    logger.info(
+        "🐍 Python 3.11"
+    )
+
+    logger.info(
+        "🤖 discord.py 2.x"
+    )
+
+    logger.info(
+        "🌐 Ethereum Mainnet"
+    )
+
+    logger.info(
+        "📡 Alchemy WSS"
+    )
+
+    logger.info(
+        "💾 Mode RAM limité activé"
+    )
+
+    logger.info(
+        "🔄 Reconnexion automatique activée"
+    )
+
+    logger.info(
+        "🚫 Aucun asyncio.run() utilisé"
+    )
+
+    logger.info(
+        "▶️ Démarrage avec bot.run()..."
+    )
+
+    logger.info("=" * 70)
+
+
+    # ========================================================
+    # IMPORTANT POUR FADEHOST
+    #
+    # On n'utilise PAS :
+    #
+    #     asyncio.run(...)
+    #
+    # discord.py gère lui-même la boucle asyncio.
+    #
+    # setup_hook() démarre le moteur Mempool
+    # parallèlement à Discord.
+    # ========================================================
+
+    bot.run(
+        DISCORD_TOKEN
+    )
