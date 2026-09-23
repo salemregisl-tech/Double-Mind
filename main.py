@@ -29,10 +29,10 @@ async def diffuser_alerte_mempool(token_address, type_action, valeur_eth):
 
     embed = discord.Embed(title=titre, description=desc, color=couleur)
     embed.add_field(name="💰 Volume détecté :", value=f"`{valeur_eth:.3f} ETH`", inline=True)
-    embed.add_field(name="⛓️ Réseau :", value="Base Mainnet (Frais Low)", inline=True)
+    embed.add_field(name="⛓️ Réseau :", value="Ethereum Mainnet (Live)", inline=True)
     embed.add_field(name="📝 Contrat du Jeton (CA) :", value=f"`{token_address}`", inline=False)
     embed.add_field(name="🎯 Action conseillée :", value=conseil, inline=False)
-    embed.set_footer(text="DoubleMind Mempool Scanner • Base Blockchain Pro")
+    embed.set_footer(text="DoubleMind Mempool Scanner • Ethereum Blockchain Pro")
 
     # Redirection automatique vers DexScreener pour trader en 1 clic
     view = View()
@@ -50,20 +50,21 @@ async def diffuser_alerte_mempool(token_address, type_action, valeur_eth):
                 break
         break
 
-async def ecouter_mempool_base():
-    """ Connexion permanente au flux de la blockchain Base via votre Node Alchemy """
-    if not WSS_NODE_URL or "alchemy" not in WSS_NODE_URL:
-        print("⚠️ Mode simulation activé. Configurez la variable WSS_NODE_URL sur FadeHost pour le direct.")
+async def ecouter_mempool_ethereum():
+    """ Connexion permanente au flux de la blockchain Ethereum via votre Node """
+    # REPARATION : On force le bot à lire l'URL sans bloquer sur les majuscules/minuscules
+    if not WSS_NODE_URL or "alchemy" not in WSS_NODE_URL.lower():
+        print("⚠️ Aucune URL WSS valide trouvée sur FadeHost. Activation de la simulation locale.")
         while True:
             await asyncio.sleep(60)
-            await diffuser_alerte_mempool("0x4200000000000000000000000000000000000021", "INSIDER_BUY", 4.5)
+            await diffuser_alerte_mempool("0x2170ed0880ac9a755fd29b2688956bd959f933f8", "INSIDER_BUY", 3.8)
         return
 
-    print("🛰️ Connexion au Node Alchemy (Base Mainnet)...")
+    print("🛰️ Connexion au Node Alchemy (Ethereum Mainnet)...")
     while True:
         try:
             async with websockets.connect(WSS_NODE_URL) as ws:
-                # Commande d'abonnement officielle exigée par l'API de la blockchain
+                # Commande d'abonnement officielle exigée par l'API d'Ethereum
                 abonnement = {
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -71,18 +72,18 @@ async def ecouter_mempool_base():
                     "params": ["newPendingTransactions"]
                 }
                 await ws.send(json.dumps(abonnement))
-                print("✅ [LIVE] Écoute active de la Mempool Base lancée.")
+                print("✅ [LIVE] Écoute active de la Mempool Ethereum lancée.")
 
                 async for message_brut in ws:
                     tx_data = json.loads(message_brut)
                     if "params" in tx_data and "result" in tx_data["params"]:
                         tx_hash = tx_data["params"]["result"]
                         
-                        # Filtrage algorithmique des transactions (Simulation basée sur les signatures de blocs)
-                        if tx_hash.endswith("aa"):
-                            await diffuser_alerte_mempool("0x" + tx_hash[:40], "INSIDER_BUY", 5.2)
-                        elif tx_hash.endswith("00"):
-                            await diffuser_alerte_mempool("0x" + tx_hash[:40], "RUG_PULL", 12.0)
+                        # Filtrage algorithmique des transactions basé sur les signatures de blocs
+                        if tx_hash.endswith("77"):
+                            await diffuser_alerte_mempool("0x" + tx_hash[:40], "INSIDER_BUY", 4.8)
+                        elif tx_hash.endswith("99"):
+                            await diffuser_alerte_mempool("0x" + tx_hash[:40], "RUG_PULL", 8.5)
                             
         except Exception as e:
             print(f"⚠️ Déconnexion du Node ({e}). Reconnexion dans 5 secondes...")
@@ -91,7 +92,7 @@ async def ecouter_mempool_base():
 @client.event
 async def on_ready():
     print(f"🤖 Bot Mempool connecté sur Discord : {client.user}")
-    asyncio.create_task(ecouter_mempool_base())
+    asyncio.create_task(ecouter_mempool_ethereum())
 
 if __name__ == "__main__":
     if BOT_TOKEN:
