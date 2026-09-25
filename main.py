@@ -11,7 +11,7 @@ logger = logging.getLogger("DoubleMind-Oracle")
 
 BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
 
-# L'URL de l'API publique d'historique de 1win interceptée en F12
+# L'URL de l'API publique d'historique de 1win
 URL_API_HISTORIQUE = "https://gamedev-tech.cc"
 
 intents = discord.Intents.default()
@@ -33,7 +33,6 @@ def analyser_strategies_oracle(session_history):
     if len(session_history) < 3:
         return None
 
-    # Extraction des 3 derniers vrais tirages réels du casino
     t_moins_2 = session_history[-3]
     t_moins_1 = session_history[-2]
     t_actuel  = session_history[-1]
@@ -92,19 +91,14 @@ async def scraper_historique_1win_en_continu():
 
     while True:
         try:
-            # Requete HTTP sur l'API publique de 1win (Pèse moins de 0.002 Mo, idéal Cloud)
             response = requests.get(URL_API_HISTORIQUE, headers=headers, timeout=10)
             if response.status_code == 200:
                 data = response.json()
-                
-                # Récupération de la liste des derniers tirages réels
                 manches_recues = data.get("history", [])
                 if manches_recues:
-                    # On prend la dernière manche qui vient de se terminer
                     derniere_manche = manches_recues[0]
-                    id_manche = premiere_manche.get("id")
+                    id_manche = Samples_id = Lab_id = derniere_manche.get("id")
                     
-                    # Si c'est une nouvelle manche qu'on n'a pas encore analysée
                     if id_manche not in historique_manches_traitees:
                         historique_manches_traitees.append(id_manche)
                         if len(historique_manches_traitees) > 100: historique_manches_traitees.pop(0)
@@ -129,7 +123,6 @@ async def scraper_historique_1win_en_continu():
                                 logger.info("🚀 Stratégie validée sur de vrais chiffres ! Envoi Discord.")
                                 await diffuser_signal_discord(prediction)
                                 
-            # Interrogation de l'historique toutes les 15 secondes (vitesse d'une manche)
             await asyncio.sleep(15)
             
         except Exception as e:
@@ -139,7 +132,8 @@ async def scraper_historique_1win_en_continu():
 @client.event
 async def on_ready():
     logger.info(f"🤖 Bot Oracle connecté sur Discord : {client.user}")
-    asyncio.create_task(scanner_historique_1win_en_continu())
+    # CORRECTION : Le nom de la fonction appelée correspond exactement à sa déclaration ci-dessus
+    asyncio.create_task(scraper_historique_1win_en_continu())
 
 if __name__ == "__main__":
     if BOT_TOKEN:
