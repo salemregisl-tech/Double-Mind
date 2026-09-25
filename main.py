@@ -85,8 +85,9 @@ class BoutonPredictionView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    # 🔒 REPARATION CRUCIALE : Ajout de la variable 'button' pour détruire l'erreur de TypeError Arguments
     @discord.ui.button(label="🔮 Demander la prédiction", style=discord.ButtonStyle.success, custom_id="btn_prediction_oracle")
-    async def prediction_callback(self, interaction: discord.Interaction):
+    async def prediction_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Stop le bug d'expiration des 3 secondes de Discord
         await interaction.response.defer(ephemeral=True)
         reponse_oracle = verifier_cycles_oracle()
@@ -118,7 +119,7 @@ async def scraper_historique_1win_en_continu():
                 manches_recues = data.get("history", [])
                 if manches_recues:
                     derniere_manche = manches_recues[0]
-                    id_manche = derniere_manche.get("id")
+                    id_manche =  derniere_manche.get("id")
                     
                     # Traitement uniquement s'il s'agit d'un nouveau tirage qui vient de tomber
                     if id_manche not in historique_manches_traitees:
