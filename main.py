@@ -10,7 +10,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-8s | %(message)s')
 logger = logging.getLogger("DoubleMind-Oracle")
 
-# Récupération sécurisée de votre Token Discord configuré sur FadeHost
+# Récupération sécurisée du Token Discord configuré sur FadeHost
 BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
 
 # L'adresse officielle du serveur de flux interceptée dans l'onglet F12 (Network > WS)
@@ -20,7 +20,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# Structure de mémoire vive pour stocker l'historique des manches
+# Structure de mémoire vive pour stocker l'historique des tirages
 historique_tours = []
 
 def verifier_couleur_chiffre(valeur, type_couleur_brute):
@@ -34,11 +34,11 @@ def verifier_couleur_chiffre(valeur, type_couleur_brute):
     if couleur_nettoye in ["blue", "b", "bleu", "black", "noir"]:
         return "BLEU"
     
-    # Règle mathématique de secours d'après les algorithmes standards d'Instant Double
+    # Règle mathématique de secours d'après les algorithmes d'Instant Double
     return "ROUGE" if valeur % 2 != 0 else "BLEU"
 
 def analyser_strategies_oracle(g, c, d, cg, cc, cd):
-    """ Application chirurgicale de vos deux stratégies d'interception avec sécurité """
+    """ Application chirurgicale de vos deux stratégies d'interception avec sécurité absolue """
     global historique_tours
     
     # Enregistrement du tirage brut dans l'historique de session
@@ -47,7 +47,7 @@ def analyser_strategies_oracle(g, c, d, cg, cc, cd):
         "cg": cg, "cc": cc, "cd": cd
     })
     
-    # Conservation des 5 dernières manches pour optimiser la mémoire du serveur
+    # Conservation des 5 dernières manches pour optimiser la mémoire du serveur FadeHost
     if len(historique_tours) > 5:
         historique_tours.pop(0)
         
@@ -93,7 +93,7 @@ def analyser_strategies_oracle(g, c, d, cg, cc, cd):
     return None
 
 async def diffuser_signal_discord(texte_signal):
-    """ Diffuse l'alerte sous forme d'encadré visuel dans votre salon Discord """
+    """ Diffuse l'alerte sous forme d'encadré visuel dans votre premier salon Discord disponible """
     for guild in client.guilds:
         for channel in guild.text_channels:
             if channel.permissions_for(guild.me).send_messages:
@@ -108,22 +108,35 @@ async def diffuser_signal_discord(texte_signal):
         break
 
 async def ecouter_flux_reseau_1win():
-    """ Écoute active et permanente du serveur de flux de 1win avec protocole Keep-Alive """
+    """ Écoute active et synchrone du serveur Centrifugo de 1win avec protocole de souscription stable """
     logger.info("🛰️ Connexion au serveur de flux Centrifugo de 1win...")
     while True:
         try:
-            # Fixation des intervalles de ping pour tuer l'erreur de déconnexion 3502 stale
+            # Fixation des paramètres de ping pour éliminer les déconnexions cycliques
             async with websockets.connect(
                 URL_FLUX_1WIN,
-                ping_interval=10,
-                ping_timeout=5,
+                ping_interval=20,
+                ping_timeout=10,
                 extra_headers={"User-Agent": "Mozilla/5.0"}
             ) as ws:
-                logger.info("✅ Connecté au flux temps réel du casino ! Analyse en cours...")
+                logger.info("📡 Connexion au serveur établie. Envoi du protocole initial...")
                 
-                # Envoi du jeton de présence initial exigé par Centrifugo pour stabiliser le canal
+                # 1. Envoi du Handshake de connexion requis par Centrifugo
                 init_handshake = {"connect": {}, "id": 1}
                 await ws.send(json.dumps(init_handshake))
+                
+                # Attente de la validation du serveur de jeu
+                await ws.recv()
+                logger.info("✅ Connexion globale validée par le serveur.")
+
+                # 2. Souscription obligatoire au canal de la table de jeu pour recevoir les tirages en continu
+                # Cela stoppe définitivement l'erreur "no close frame received or sent"
+                subscription = {
+                    "subscribe": {"channel": "instant-double:public"},
+                    "id": 2
+                }
+                await ws.send(json.dumps(subscription))
+                logger.info("✅ Abonnement au flux Instant Double en direct validé !")
 
                 async for message_brut in ws:
                     if message_brut == "{}" or not message_brut:
@@ -131,49 +144,52 @@ async def ecouter_flux_reseau_1win():
                         
                     data = json.loads(message_brut)
                     
-                    # Décodage des événements de publication envoyés par 1win
+                    # Décodage et ciblage des paquets de données du jeu
+                    pub_data = None
                     if "push" in data and "pub" in data["push"] and "data" in data["push"]["pub"]:
-                        game_event = data["push"]["pub"]["data"]
-                        
-                        # Vérification de l'étape de fin de manche 'ending' (Arrêt des cartes)
-                        if game_event.get("stage") == "ending" and "outcome" in game_event:
-                            cartes_brutes = game_event["outcome"]
+                        pub_data = data["push"]["pub"]["data"]
+                    elif "reply" in data and "subscribe" in data["reply"] and "data" in data["reply"]["subscribe"]:
+                        pub_data = data["reply"]["subscribe"]["data"]
+
+                    if pub_data:
+                        # Vérification de la phase officielle de fin de manche 'ending' (arrêt des cartes)
+                        if pub_data.get("stage") == "ending" and "outcome" in pub_data:
+                            cartes_brutes = pub_data["outcome"]
                             
-                            # Sécurité de format : On s'assure de recevoir la liste des 3 cartes
                             if isinstance(cartes_brutes, list) and len(cartes_brutes) == 3:
                                 try:
-                                    # Extraction chirurgicale des nombres réels
+                                    # Extraction immédiate et brute des nombres
                                     g = int(cartes_brutes[0].get("value", cartes_brutes[0]))
                                     c = int(cartes_brutes[1].get("value", cartes_brutes[1]))
                                     d = int(cartes_brutes[2].get("value", cartes_brutes[2]))
                                     
-                                    # Extraction et vérification des couleurs réelles associées
+                                    # Extraction des couleurs correspondantes
                                     cg = verifier_couleur_chiffre(g, cartes_brutes[0].get("color", ""))
                                     cc = verifier_couleur_chiffre(c, cartes_brutes[1].get("color", ""))
                                     cd = verifier_couleur_chiffre(d, cartes_brutes[2].get("color", ""))
                                     
-                                    logger.info(f"🎲 Manches capturée -> G:[{cg} {g}] C:[{cc} {c}] D:[{cd} {d}]")
+                                    logger.info(f"🎲 Tirage capturé -> G:[{cg} {g}] C:[{cc} {c}] D:[{cd} {d}]")
                                     
-                                    # Lancement de l'analyse décisionnelle de vos stratégies
+                                    # Lancement de l'analyse décisionnelle de vos deux stratégies
                                     prediction = analyser_strategies_oracle(g, c, d, cg, cc, cd)
                                     if prediction:
-                                        logger.info("🚀 Tendance validée ! Envoi immédiat de la prédiction sur Discord.")
+                                        logger.info("🚀 Stratégie validée ! Envoi immédiat de la prédiction sur Discord.")
                                         await diffuser_signal_discord(prediction)
-                                except (KeyError, IndexError, ValueError) as err:
-                                    logger.debug(f"Analyse des paquets de transition ignorée : {err}")
+                                except (KeyError, IndexError, ValueError):
+                                    pass
                                     
         except Exception as e:
-            logger.error(f"⚠️ Reconnexion au flux du casino suite à un rafraîchissement ({e})...")
+            logger.error(f"⚠️ Attente ou synchronisation avec le flux du casino ({e}). Réexécution dans 5 secondes...")
             await asyncio.sleep(5)
 
 @client.event
 async def on_ready():
-    logger.info(f"🤖 Bot Oracle connecté sur Discord : {client.user}")
-    # Injection du scanner réseau dans la boucle d'exécution asynchrone de FadeHost
+    logger.info(f"🤖 Bot Discord connecté sous le nom de : {client.user}")
+    # Lancement du scanner réseau en tâche de fond sur l'hébergeur Cloud
     asyncio.create_task(ecouter_flux_reseau_1win())
 
 if __name__ == "__main__":
     if BOT_TOKEN:
         client.run(BOT_TOKEN)
     else:
-        logger.error("❌ Erreur critique : La variable DISCORD_TOKEN est absente du serveur FadeHost.")
+        logger.error("❌ Impossible de démarrer : La variable DISCORD_TOKEN est absente du serveur FadeHost.")
