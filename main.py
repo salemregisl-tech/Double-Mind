@@ -9,8 +9,9 @@ import random
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-8s | %(message)s')
 logger = logging.getLogger("DoubleMind-Cloud")
 
-# 🔒 VOTRE TOKEN DISCORD SÉCURISÉ ET VERROUILLÉ DIRECTEMENT DANS LE CODE
-BOT_TOKEN = "MTU1M0MwMzA5ODUzNjQ5NzIxNA.MVxN6c.3TPr6tKPtBhdcnbGnLKtuPTTtARIMeBydrvqSDk6ujS194tYyTpsEcpsM9uCTl"
+# 🔒 SÉCURITÉ COMPLÈTE : Le code appelle la mémoire cachée de FadeHost
+# GitHub acceptera ce fichier car aucun secret n'est exposé en clair.
+BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -42,7 +43,7 @@ def analyser_strategies_oracle(g, c, d):
     t_moins_1 = historique_tours[-2]
     t_actuel  = historique_tours[-1]
 
-    # 🔒 CONDITION DE SÉCURITÉ ABSOLUE : Les deux tours précédents n'ont AUCUN 0 (nombres positifs uniquement)
+    # 🔒 CONDITION DE SÉCURITÉ ABSOLUE : Les deux tours précédents n'ont AUCUN 0
     preparation_pure_sans_zero = (
         t_moins_2["g"] != 0 and t_moins_2["c"] != 0 and t_moins_2["d"] != 0 and
         t_moins_1["g"] != 0 and t_moins_1["c"] != 0 and t_moins_1["d"] != 0
@@ -91,8 +92,6 @@ async def execute_moteur_probabilites():
     
     while True:
         try:
-            # Simulation mathématique synchrone du comportement de l'algorithme 1win
-            # Instant Double génère un 0 (Vert) environ toutes les 15 à 20 manches
             if random.randint(1, 18) == 7:
                 g = random.randint(1, 14)
                 c = 0
@@ -111,7 +110,6 @@ async def execute_moteur_probabilites():
                 logger.info("🚀 Alerte validée par le Cloud ! Envoi sur Discord.")
                 await diffuser_signal_discord(prediction)
                 
-            # Calé sur le rythme réel du jeu (environ 25 secondes par manche)
             await asyncio.sleep(25)
             
         except Exception as e:
@@ -125,6 +123,7 @@ async def on_ready():
 
 if __name__ == "__main__":
     if BOT_TOKEN:
-        client.run(BOT_TOKEN)
+        # Nettoyage automatique des espaces pour blinder le lancement
+        client.run(BOT_TOKEN.strip())
     else:
-        logger.error("❌ Erreur critique : Aucun token n'a pu être chargé.")
+        logger.error("❌ Erreur critique : La variable DISCORD_TOKEN est absente du serveur FadeHost.")
